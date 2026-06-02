@@ -4,24 +4,27 @@
 
 **Goal:** Build a hands-free voice play station where a kindergartner describes one of 9 animals, an AI mascot deliberately guesses wrong 1-2 times then correct, packaged to .dmg/.exe/.apk with the API key kept out of the JS bundle.
 
-**Architecture:** Tauri v2 shell. A web frontend (Vite + React + TypeScript) renders the Memphis UI and owns the game state machine and audio capture. A Rust core (Tauri commands) holds the obfuscated Bailian API key and performs all network calls (ASR, LLM inference, TTS). Voice is **batch-per-utterance**: the webview records a clip, auto-stops on silence (VAD), and sends the clip to Rust for one-shot recognition — this preserves the hands-free UX of the spec's "real-time + VAD" while being far more robust and unit-testable than a raw streaming socket.
+**Architecture:** Tauri v2 shell. A web frontend (Vite + React + TypeScript) renders the Memphis UI and owns the game state machine and audio capture. A Rust core (Tauri commands) holds the obfuscated Bailian API key and performs all network calls (ASR, LLM inference, TTS). Voice is **utterance-bounded streaming**: the webview records one utterance, auto-stops on silence (VAD), encodes it to 16kHz mono WAV, and hands the bytes to Rust; Rust streams that utterance to DashScope's real-time ASR WebSocket and collects the transcript. (DashScope has no synchronous "POST a clip, get text" REST endpoint — its file API is async + needs a public URL — so a WebSocket client in Rust is required. TTS is likewise WebSocket-only.)
 
-**Tech Stack:** Tauri v2, Rust (reqwest, serde, base64), Vite + React 18 + TypeScript, Vitest (frontend tests), cargo test (Rust tests), canvas-confetti, Web Audio API for capture/VAD.
+**Tech Stack:** Tauri v2, Rust (reqwest, tokio-tungstenite, futures-util, uuid, serde, base64), Vite + React 18 + TypeScript, Vitest (frontend tests), cargo test (Rust tests), canvas-confetti, Web Audio API for capture/VAD.
 
 ---
 
 ## Architectural Decisions (read before starting)
 
-- **Voice is batch-per-utterance, not socket-streaming.** JS captures audio via `getUserMedia`, runs an energy-based VAD that stops the recording after ~900ms of trailing silence, encodes the clip to 16kHz mono WAV, and passes the bytes to the Rust `transcribe` command. Rust calls Bailian one-shot ASR and returns a transcript. This is a deliberate refinement of the spec's "real-time streaming" and is the intended design.
+- **Voice is utterance-bounded streaming.** JS captures audio via `getUserMedia`, runs an energy-based VAD that stops the recording after ~900ms of trailing silence, encodes the clip to 16kHz mono WAV, and passes the bytes to the Rust `transcribe` command. Rust opens a DashScope ASR **WebSocket**, sends `run-task`, streams the WAV in ~3.2KB binary frames, sends `finish-task`, and concatenates the `result-generated` sentences into the transcript. This keeps the hands-free UX while using the only ASR transport DashScope actually offers for live audio.
+- **Resilience is mandatory (unattended booth).** Every async voice phase in the orchestrator is wrapped in try/finally that always clears the busy flag, dispatches a reset on error, and is bounded by a watchdog timeout. The `awaiting` phase re-listens on unrecognized input (with a re-prompt) up to a cap, then resets. The booth must never freeze.
 - **The API key never appears in source or the JS bundle.** `build.rs` reads the key from the `BAILIAN_API_KEY` environment variable at compile time, XOR-obfuscates it against a fixed pad, and generates `obfuscated_key.rs`. The plaintext key lives only in the builder's environment, never in git, never in JS. Runtime deobfuscation happens in Rust.
 - **Inference is constrained to the 9 animals.** The LLM prompt lists all 9 and must return exactly one of those names. The frontend validates the returned name against the known set; an unknown result falls back to the engine's nearest-match (handled in Task 2.3).
 - **Wrong-then-right is deterministic.** The game engine, not the LLM, decides the guess order. The LLM only (a) infers the target and (b) phrases lines. This guarantees the pedagogy every run.
 
 ### Bailian / DashScope endpoints (confirm exact model ids against current docs during Task 3)
 
-- **LLM:** OpenAI-compatible endpoint `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`, model `qwen-plus`. Stable; used as-is in this plan.
-- **ASR:** DashScope speech recognition for a recorded clip (Paraformer family, e.g. `paraformer-v2`). The exact request shape is verified in Task 3.4 against docs; the Rust client isolates this in one function so a doc-driven tweak touches one place.
-- **TTS:** DashScope CosyVoice (`cosyvoice-v1`), an English-capable voice id (default candidate `longxiaochun`; final voice chosen in Task 3.5). Returns audio bytes played by the webview.
+All three share the host `dashscope.aliyuncs.com` (Mainland). The LLM is REST; ASR and TTS are WebSocket on the shared inference endpoint `wss://dashscope.aliyuncs.com/api-ws/v1/inference`.
+
+- **LLM (REST):** `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`, model `qwen-plus`, `Authorization: Bearer <key>`. Stable; used as-is.
+- **ASR (WebSocket):** `wss://dashscope.aliyuncs.com/api-ws/v1/inference`, header `Authorization: bearer <key>`. Protocol: send `run-task` (`task_group:"audio"`, `task:"asr"`, `function:"recognition"`, `model:"paraformer-realtime-v2"`, `parameters:{format:"wav", sample_rate:16000}`), wait for the `task-started` event, send the WAV bytes as binary frames (~3.2KB each), send `finish-task`, then read `result-generated` events and concatenate every `payload.output.sentence.text` where `sentence_end == true`; stop on `task-finished`.
+- **TTS (WebSocket):** same URL, headers `Authorization: bearer <key>` + `X-DashScope-DataInspection: enable`. Protocol: `run-task` (`task_group:"audio"`, `task:"tts"`, `function:"SpeechSynthesizer"`, `model:"cosyvoice-v2"`, `parameters:{text_type:"PlainText", voice:"<english-voice>", format:"mp3", sample_rate:22050}`), wait for `task-started`, send `continue-task` with the text, send `finish-task`; collect all **binary** frames in order = the MP3; stop on `task-finished`. The final English voice id is chosen in Task 3.5 Step 1.
 
 ---
 
@@ -70,9 +73,10 @@ kindergarten-guess/
       keystore.rs               # deobfuscate (uses generated obfuscated_key.rs)
       bailian/
         mod.rs
-        llm.rs                  # build_llm_request, parse_llm_response, call
-        asr.rs                  # transcribe clip
-        tts.rs                  # synthesize
+        ws.rs                   # shared WebSocket helpers (run-task json, connect)
+        llm.rs                  # build_llm_request, parse_llm_response, call (REST)
+        asr.rs                  # transcribe clip via realtime ASR WebSocket
+        tts.rs                  # synthesize via CosyVoice WebSocket
       commands.rs               # #[tauri::command] infer_animal, transcribe, synthesize
   assets/
     animals/                    # 9 pre-generated scene images (Task 6)
@@ -218,10 +222,13 @@ fn main() {
     let b64 = base64_encode(&obf);
     let out = env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out).join("obfuscated_key.rs");
+    // Emit the SAME `PAD` used for encoding (single source of truth) as a byte array,
+    // so the decoder can never drift from the encoder.
+    let pad_literal = format!("{:?}", PAD); // e.g. "[98, 105, 98, ...]"
     fs::write(
         &dest,
         format!(
-            "pub const OBFUSCATED_KEY_B64: &str = \"{b64}\";\npub const PAD: &[u8] = b\"bibo-guess-the-animal-pad-v1-do-not-rely-on-secrecy\";\n"
+            "pub const OBFUSCATED_KEY_B64: &str = \"{b64}\";\npub const PAD: &[u8] = &{pad_literal};\n"
         ),
     )
     .unwrap();
@@ -558,7 +565,7 @@ git commit -m "feat: fuzzy command matching for try-again/confirm with tests"
 
 ```ts
 import { expect, test } from "vitest";
-import { initialState, reduce } from "./machine";
+import { initialState, reduce, currentGuess } from "./machine";
 import { animalByName } from "./animals";
 
 const elephant = animalByName("Elephant")!;
@@ -582,30 +589,41 @@ test("happy path: pick -> listen -> infer -> guess wrong -> try again -> correct
   // inference resolves + a deterministic plan with exactly 1 wrong is injected
   s = reduce(s, { type: "PLAN_READY", plan: [animalByName("Snake")!, elephant] });
   expect(s.phase).toBe("guessing");
-  expect(s.currentGuess?.id).toBe("snake");
+  expect(currentGuess(s)?.id).toBe("snake");
 
   s = reduce(s, { type: "GUESS_SPOKEN" });
   expect(s.phase).toBe("awaiting");
 
   s = reduce(s, { type: "COMMAND", command: "try_again" });
   expect(s.phase).toBe("guessing");
-  expect(s.currentGuess?.id).toBe("elephant");
+  expect(currentGuess(s)?.id).toBe("elephant");
 
   s = reduce(s, { type: "GUESS_SPOKEN" });
   s = reduce(s, { type: "COMMAND", command: "confirm" });
   expect(s.phase).toBe("celebrating");
 });
 
-test("confirm before the correct guess is ignored (still awaiting)", () => {
+test("only try_again advances a wrong guess; confirm-on-wrong is ignored", () => {
   let s = initialState();
   s = reduce(reduce(s, { type: "START" }), { type: "PICK", animal: elephant });
   s = reduce(s, { type: "UTTERANCE_CAPTURED", transcript: "big nose" });
   s = reduce(s, { type: "PLAN_READY", plan: [animalByName("Snake")!, elephant] });
   s = reduce(s, { type: "GUESS_SPOKEN" }); // awaiting, current = snake (wrong)
+
+  // confirming a WRONG guess must NOT advance or celebrate (spec: only "yes it is" on the correct one)
   s = reduce(s, { type: "COMMAND", command: "confirm" });
-  // child confirmed a wrong guess — treat as try_again so the game advances
+  expect(s.phase).toBe("awaiting");
+  expect(currentGuess(s)?.id).toBe("snake");
+
+  // an unknown utterance must also NOT advance (spec: advance only on "try guessing again")
+  s = reduce(s, { type: "COMMAND", command: "unknown" });
+  expect(s.phase).toBe("awaiting");
+  expect(currentGuess(s)?.id).toBe("snake");
+
+  // try_again advances to the correct guess
+  s = reduce(s, { type: "COMMAND", command: "try_again" });
   expect(s.phase).toBe("guessing");
-  expect(s.currentGuess?.id).toBe("elephant");
+  expect(currentGuess(s)?.id).toBe("elephant");
 });
 
 test("RESET returns to attract", () => {
@@ -647,48 +665,48 @@ export function initialState(): GameState {
   return { phase: "attract", target: null, transcript: "", plan: [], guessIndex: -1 };
 }
 
-function currentGuess(s: GameState): Animal | null {
+/** Selector for the current/last guess. Use this instead of stashing it on state. */
+export function currentGuess(s: GameState): Animal | null {
   return s.guessIndex >= 0 ? s.plan[s.guessIndex] ?? null : null;
 }
 
-// Re-export a convenience getter used by tests and UI.
-export function withCurrent(s: GameState): GameState & { currentGuess: Animal | null } {
-  return { ...s, currentGuess: currentGuess(s) };
-}
-
-export function reduce(state: GameState, action: Action): GameState & { currentGuess: Animal | null } {
-  const wrap = (s: GameState) => withCurrent(s);
-
+/** Pure reducer: (GameState, Action) => GameState — directly usable with useReducer. */
+export function reduce(state: GameState, action: Action): GameState {
   switch (action.type) {
     case "RESET":
-      return wrap(initialState());
+      return initialState();
     case "START":
-      return wrap({ ...initialState(), phase: "picking" });
+      return { ...initialState(), phase: "picking" };
     case "PICK":
-      return wrap({ ...state, phase: "listening", target: action.animal });
+      return { ...state, phase: "listening", target: action.animal };
     case "UTTERANCE_CAPTURED":
-      return wrap({ ...state, phase: "thinking", transcript: action.transcript });
+      return { ...state, phase: "thinking", transcript: action.transcript };
     case "PLAN_READY":
-      return wrap({ ...state, phase: "guessing", plan: action.plan, guessIndex: 0 });
+      return { ...state, phase: "guessing", plan: action.plan, guessIndex: 0 };
     case "GUESS_SPOKEN":
-      return wrap({ ...state, phase: "awaiting" });
+      return { ...state, phase: "awaiting" };
     case "COMMAND": {
       const cur = currentGuess(state);
       const isCorrect = !!cur && !!state.target && cur.id === state.target.id;
+      // Celebrate only when the child confirms the CORRECT guess.
       if (action.command === "confirm" && isCorrect) {
-        return wrap({ ...state, phase: "celebrating" });
+        return { ...state, phase: "celebrating" };
       }
-      // try_again, OR confirm on a wrong guess, OR unknown: advance to next guess
-      const next = Math.min(state.guessIndex + 1, state.plan.length - 1);
-      return wrap({ ...state, phase: "guessing", guessIndex: next });
+      // Advance ONLY on an explicit "try guessing again" (spec step 5).
+      if (action.command === "try_again") {
+        const next = Math.min(state.guessIndex + 1, state.plan.length - 1);
+        return { ...state, phase: "guessing", guessIndex: next };
+      }
+      // confirm-on-wrong or unknown: ignore — stay awaiting (orchestrator re-prompts).
+      return state;
     }
     default:
-      return wrap(state);
+      return state;
   }
 }
 ```
 
-> The `reduce` return type includes a derived `currentGuess` for ergonomic UI/test use. `unknown` commands during `awaiting` advance the guess; the LLM fallback in Task 7 upgrades `unknown` to a real command before this point when possible.
+> The reducer is a pure `(GameState, Action) => GameState`, so `useReducer` is fully typed in Task 7 (no `as any`). The current guess is derived via the `currentGuess` selector. Crucially, only `try_again` advances a wrong guess and only `confirm` on the correct guess celebrates — `unknown` and confirm-on-wrong are ignored, matching the spec's "advance only on Try guessing again". The orchestrator (Task 7) handles ignored input by re-listening with a re-prompt and a watchdog.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -718,6 +736,18 @@ git commit -m "feat: game state machine with full happy-path tests"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+```
+
+Also update `src-tauri/src/bailian/mod.rs` to include the WebSocket helper module:
+```rust
+pub mod ws;
+pub mod llm;
+pub mod asr;
+pub mod tts;
 ```
 
 - [ ] **Step 2: Write the failing test in `src-tauri/src/bailian/llm.rs`**
@@ -785,16 +815,17 @@ mod tests {
 
 Create `src-tauri/src/bailian/mod.rs`:
 ```rust
+pub mod ws;
 pub mod llm;
 pub mod asr;
 pub mod tts;
 ```
-Add `mod bailian;` to `src-tauri/src/main.rs`.
+Add `mod bailian;` to `src-tauri/src/main.rs`. Create empty `ws.rs`, `asr.rs`, `tts.rs` placeholders (filled in Tasks 3.4a/3.4/3.5) so this module compiles now.
 
 - [ ] **Step 3: Run to verify it fails then passes**
 
 Run: `cd src-tauri && cargo test bailian::llm 2>&1 | tail -20; cd ..`
-First expected: FAIL (asr/tts modules referenced by mod.rs don't exist yet) — create empty `asr.rs` and `tts.rs` with `// placeholder for Task 3.4/3.5` then re-run.
+First expected: FAIL (ws/asr/tts modules referenced by mod.rs don't exist yet) — create empty `ws.rs`, `asr.rs`, `tts.rs` with `// placeholder` then re-run.
 Final expected: 2 passed.
 
 - [ ] **Step 4: Commit**
@@ -924,40 +955,146 @@ git add src/voice/wav.ts src/voice/wav.test.ts
 git commit -m "feat: 16k mono wav encoder with tests"
 ```
 
-### Task 3.4: ASR call (clip transcription)
+### Task 3.4a: Shared WebSocket helper
+
+**Files:**
+- Modify: `src-tauri/src/bailian/ws.rs`
+
+DashScope ASR and TTS both use the duplex run-task protocol over `wss://dashscope.aliyuncs.com/api-ws/v1/inference`. This helper centralizes connecting and the event-wait loop.
+
+- [ ] **Step 1: Implement `src-tauri/src/bailian/ws.rs`**
+
+```rust
+use futures_util::StreamExt;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    connect_async, MaybeTlsStream, WebSocketStream,
+    tungstenite::client::IntoClientRequest,
+    tungstenite::http::HeaderValue,
+    tungstenite::Message,
+};
+
+pub const WS_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
+pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Open an authenticated DashScope inference WebSocket.
+/// `data_inspection` adds the header required by TTS.
+pub async fn connect(api_key: &str, data_inspection: bool) -> Result<Ws, String> {
+    let mut req = WS_URL.into_client_request().map_err(|e| format!("ws req: {e}"))?;
+    let headers = req.headers_mut();
+    headers.insert(
+        "Authorization",
+        HeaderValue::from_str(&format!("bearer {api_key}")).map_err(|e| e.to_string())?,
+    );
+    if data_inspection {
+        headers.insert("X-DashScope-DataInspection", HeaderValue::from_static("enable"));
+    }
+    let (ws, _resp) = connect_async(req).await.map_err(|e| format!("ws connect: {e}"))?;
+    Ok(ws)
+}
+
+pub fn new_task_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Reads text frames until the named event arrives. Errors on task-failed or early close.
+pub async fn wait_for_event(socket: &mut Ws, event: &str) -> Result<(), String> {
+    while let Some(msg) = socket.next().await {
+        let msg = msg.map_err(|e| format!("ws recv: {e}"))?;
+        if let Message::Text(t) = msg {
+            let v: serde_json::Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+            match v["header"]["event"].as_str() {
+                Some(e) if e == event => return Ok(()),
+                Some("task-failed") => {
+                    return Err(format!("task-failed: {}", v["header"]["error_message"]));
+                }
+                _ => {}
+            }
+        }
+    }
+    Err(format!("ws closed before {event}"))
+}
+```
+
+- [ ] **Step 2: Verify it compiles**
+
+Run: `cd src-tauri && cargo build 2>&1 | tail -5; cd ..`
+Expected: builds.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src-tauri/src/bailian/ws.rs && git commit -m "feat: shared dashscope websocket helper"
+```
+
+### Task 3.4: ASR over WebSocket (utterance transcription)
 
 **Files:**
 - Modify: `src-tauri/src/bailian/asr.rs`
 
-- [ ] **Step 1: Read current DashScope speech-recognition docs**
+- [ ] **Step 1: Confirm the model id**
 
-Confirm the request shape for recorded-clip recognition (Paraformer family). The function below targets the DashScope multimodal/ASR HTTP API; adjust the URL, model id (`paraformer-v2`), and JSON keys to match current docs. Keep all Bailian-specific shape in this one function.
+Verify `paraformer-realtime-v2` is the correct multilingual/English real-time model id in the current DashScope console (alternatives: `paraformer-realtime-8k-v2`, `fun-asr-realtime`). All protocol shape below is from the documented WebSocket API; only the model id may need adjusting.
 
 - [ ] **Step 2: Implement `transcribe`**
 
 ```rust
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+use super::ws;
 
-/// Transcribes a WAV clip (bytes) to English text via DashScope ASR.
-/// NOTE: verify endpoint/model/keys against current DashScope docs (Task 3.4 Step 1).
+/// Streams a 16k mono WAV clip to DashScope real-time ASR and returns the transcript.
 pub async fn transcribe(api_key: &str, wav_bytes: &[u8]) -> Result<String, String> {
-    let audio_b64 = STANDARD.encode(wav_bytes);
-    let client = reqwest::Client::new();
-    let resp = client
-        .post("https://dashscope.aliyuncs.com/api/v1/services/audio/asr/recognition")
-        .bearer_auth(api_key)
-        .json(&serde_json::json!({
-            "model": "paraformer-v2",
-            "input": { "audio": format!("data:audio/wav;base64,{audio_b64}"), "language": "en" }
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("asr request failed: {e}"))?;
-    let body: serde_json::Value = resp.json().await.map_err(|e| format!("asr decode failed: {e}"))?;
-    // Adjust path to match the documented response shape.
-    body.get("output").and_then(|o| o.get("text")).and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| format!("no transcript in asr response: {body}"))
+    let mut socket = ws::connect(api_key, false).await?;
+    let task_id = ws::new_task_id();
+
+    let run = serde_json::json!({
+        "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
+        "payload": {
+            "task_group": "audio", "task": "asr", "function": "recognition",
+            "model": "paraformer-realtime-v2",
+            "parameters": { "format": "wav", "sample_rate": 16000 },
+            "input": {}
+        }
+    });
+    socket.send(Message::Text(run.to_string())).await.map_err(|e| format!("asr run-task: {e}"))?;
+    ws::wait_for_event(&mut socket, "task-started").await?;
+
+    // Stream the clip as binary frames (~3.2KB).
+    for chunk in wav_bytes.chunks(3200) {
+        socket.send(Message::Binary(chunk.to_vec())).await.map_err(|e| format!("asr audio: {e}"))?;
+    }
+
+    let finish = serde_json::json!({
+        "header": { "action": "finish-task", "task_id": task_id, "streaming": "duplex" },
+        "payload": { "input": {} }
+    });
+    socket.send(Message::Text(finish.to_string())).await.map_err(|e| format!("asr finish: {e}"))?;
+
+    let mut transcript = String::new();
+    while let Some(msg) = socket.next().await {
+        let msg = msg.map_err(|e| format!("asr recv: {e}"))?;
+        if let Message::Text(t) = msg {
+            let v: serde_json::Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+            match v["header"]["event"].as_str() {
+                Some("result-generated") => {
+                    let s = &v["payload"]["output"]["sentence"];
+                    if s["sentence_end"].as_bool() == Some(true) {
+                        if let Some(text) = s["text"].as_str() {
+                            if !transcript.is_empty() { transcript.push(' '); }
+                            transcript.push_str(text);
+                        }
+                    }
+                }
+                Some("task-finished") => break,
+                Some("task-failed") => {
+                    return Err(format!("asr task-failed: {}", v["header"]["error_message"]));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(transcript.trim().to_string())
 }
 ```
 
@@ -969,38 +1106,75 @@ Expected: builds.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src-tauri/src/bailian/asr.rs && git commit -m "feat: bailian asr clip transcription"
+git add src-tauri/src/bailian/asr.rs && git commit -m "feat: dashscope realtime asr over websocket"
 ```
 
-### Task 3.5: TTS call (synthesize speech)
+### Task 3.5: TTS over WebSocket (CosyVoice)
 
 **Files:**
 - Modify: `src-tauri/src/bailian/tts.rs`
 
-- [ ] **Step 1: Read current DashScope CosyVoice docs**
+- [ ] **Step 1: Choose an English-capable CosyVoice voice**
 
-Confirm endpoint, model (`cosyvoice-v1`), and an English-capable voice id. The function returns raw audio bytes (mp3/wav) that the webview plays.
+In the DashScope console, pick a `cosyvoice-v2` voice that reads English naturally and cheerfully (candidate: `longxiaochun_v2`). Set it as `VOICE` below. CosyVoice is WebSocket-only — there is no HTTP fallback.
 
 - [ ] **Step 2: Implement `synthesize`**
 
 ```rust
-/// Synthesizes English speech, returning audio bytes (e.g. mp3).
-/// NOTE: verify endpoint/model/voice against current DashScope docs (Task 3.5 Step 1).
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+use super::ws;
+
+const VOICE: &str = "longxiaochun_v2"; // confirm an English-capable voice (Task 3.5 Step 1)
+
+/// Synthesizes English speech via CosyVoice WebSocket; returns concatenated MP3 bytes.
 pub async fn synthesize(api_key: &str, text: &str) -> Result<Vec<u8>, String> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post("https://dashscope.aliyuncs.com/api/v1/services/aigc/text2speech/speech-synthesizer")
-        .bearer_auth(api_key)
-        .json(&serde_json::json!({
-            "model": "cosyvoice-v1",
-            "input": { "text": text },
-            "parameters": { "voice": "longxiaochun", "format": "mp3" }
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("tts request failed: {e}"))?;
-    let bytes = resp.bytes().await.map_err(|e| format!("tts read failed: {e}"))?;
-    Ok(bytes.to_vec())
+    let mut socket = ws::connect(api_key, true).await?;
+    let task_id = ws::new_task_id();
+
+    let run = serde_json::json!({
+        "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
+        "payload": {
+            "task_group": "audio", "task": "tts", "function": "SpeechSynthesizer",
+            "model": "cosyvoice-v2",
+            "parameters": { "text_type": "PlainText", "voice": VOICE, "format": "mp3", "sample_rate": 22050 },
+            "input": {}
+        }
+    });
+    socket.send(Message::Text(run.to_string())).await.map_err(|e| format!("tts run-task: {e}"))?;
+    ws::wait_for_event(&mut socket, "task-started").await?;
+
+    let cont = serde_json::json!({
+        "header": { "action": "continue-task", "task_id": task_id, "streaming": "duplex" },
+        "payload": { "input": { "text": text } }
+    });
+    socket.send(Message::Text(cont.to_string())).await.map_err(|e| format!("tts continue: {e}"))?;
+
+    let finish = serde_json::json!({
+        "header": { "action": "finish-task", "task_id": task_id, "streaming": "duplex" },
+        "payload": { "input": {} }
+    });
+    socket.send(Message::Text(finish.to_string())).await.map_err(|e| format!("tts finish: {e}"))?;
+
+    let mut audio: Vec<u8> = Vec::new();
+    while let Some(msg) = socket.next().await {
+        match msg.map_err(|e| format!("tts recv: {e}"))? {
+            Message::Binary(b) => audio.extend_from_slice(&b),
+            Message::Text(t) => {
+                let v: serde_json::Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+                match v["header"]["event"].as_str() {
+                    Some("task-finished") => break,
+                    Some("task-failed") => {
+                        return Err(format!("tts task-failed: {}", v["header"]["error_message"]));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if audio.is_empty() { return Err("tts returned no audio".into()); }
+    Ok(audio)
 }
 ```
 
@@ -1012,7 +1186,7 @@ Expected: builds.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src-tauri/src/bailian/tts.rs && git commit -m "feat: bailian cosyvoice tts synthesis"
+git add src-tauri/src/bailian/tts.rs && git commit -m "feat: cosyvoice tts over websocket"
 ```
 
 ### Task 3.6: Tauri commands exposing the pipeline
@@ -1178,7 +1352,9 @@ export async function recordUtterance(opts: VadOpts = { speechThreshold: 0.02, s
     processor.onaudioprocess = (e) => {
       const input = e.inputBuffer.getChannelData(0);
       chunks.push(new Float32Array(input));
-      buffer.push(...input);
+      // Append per-element — do NOT use buffer.push(...input): spreading a 4096-element
+      // typed array as args can throw RangeError (max call stack / arg count).
+      for (let i = 0; i < input.length; i++) buffer.push(input[i]);
       while (buffer.length >= frameSize) {
         const frame = buffer.splice(0, frameSize);
         let sum = 0;
@@ -1206,6 +1382,8 @@ export async function recordUtterance(opts: VadOpts = { speechThreshold: 0.02, s
 ```
 
 > The pure `SilenceDetector` is unit-tested. `recordUtterance` (browser-only Web Audio glue) is verified manually in Task 7. Downsampling to 16k is done by `encodeWav` callers resampling if `sampleRate !== 16000`; add a `resampleTo16k` helper in Task 4.2.
+>
+> **Deprecation note (verify on Android in Task 8.2):** `ScriptProcessorNode` is deprecated and may behave inconsistently in the Android system WebView. It is used here for simplicity. If it proves unreliable on the target tablet, migrate to an `AudioWorkletNode` (same RMS-per-frame logic, moved into a worklet processor) — the pure `SilenceDetector` is unaffected by that change.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -1600,7 +1778,9 @@ export function PlayScreen(props: {
       <MemphisBackground />
       <div style={{ position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", textAlign: "center", zIndex: 1 }}>
         <div style={{ fontWeight: 800, opacity: .6, fontSize: 12, letterSpacing: 1 }}>DESCRIBING</div>
-        <div style={{ fontSize: 48 }}>{target.emoji}</div>
+        <img src={`/animals/${target.id}.png`} alt={target.name}
+             style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 16, border: "3px solid var(--ink)", boxShadow: "3px 3px 0 var(--ink)" }}
+             onError={(e) => { const d = document.createElement("div"); d.textContent = target.emoji; d.style.fontSize = "48px"; e.currentTarget.replaceWith(d); }} />
       </div>
       <div style={{ position: "absolute", top: 150, left: 40, display: "flex", gap: 24, alignItems: "flex-start", zIndex: 1 }}>
         <Mascot state={mascot} />
@@ -1708,11 +1888,11 @@ git commit -m "assets: 9 pre-generated memphis animal scenes"
 
 ```tsx
 import { useEffect, useReducer, useRef, useState } from "react";
-import { initialState, reduce, type GameState } from "./game/machine";
+import { initialState, reduce, currentGuess } from "./game/machine";
 import { planGuessSequence } from "./game/guessing";
 import { matchCommand } from "./game/commands";
 import { animalByName } from "./game/animals";
-import type { Animal } from "./game/types";
+import type { Command } from "./game/types";
 import { listenAndTranscribe, inferAnimal, classifyCommand, speak } from "./voice/bailian";
 import { AttractScreen } from "./screens/AttractScreen";
 import { PickScreen } from "./screens/PickScreen";
@@ -1720,69 +1900,115 @@ import { PlayScreen } from "./screens/PlayScreen";
 import { CelebrationScreen } from "./screens/CelebrationScreen";
 import type { MascotState } from "./components/Mascot";
 
+const PHASE_TIMEOUT_MS = 20000;  // watchdog: no single voice phase may hang longer than this
+const MAX_AWAIT_RETRIES = 3;     // unrecognized replies before resetting for the next child
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error("timeout")), ms)),
+  ]);
+}
+
 export default function App() {
-  // useReducer wants (state, action) => state; our reduce returns state+currentGuess (a superset), which is fine.
-  const [state, dispatch] = useReducer(reduce as any, initialState() as any) as [
-    GameState & { currentGuess: Animal | null }, (a: any) => void
-  ];
+  // reduce is a pure (GameState, Action) => GameState, so useReducer is fully typed — no casts.
+  const [state, dispatch] = useReducer(reduce, undefined, initialState);
   const [kidLine, setKidLine] = useState<string | null>(null);
   const [aiLine, setAiLine] = useState<string | null>(null);
   const [mascot, setMascot] = useState<MascotState>("idle");
   const busy = useRef(false);
 
-  // Drive side effects off phase transitions.
+  // Drive side effects off phase transitions. Every branch resets `busy` in finally and
+  // resets the game on failure, so a network/mic/ASR/TTS error can never freeze the booth.
   useEffect(() => {
-    if (state.phase === "listening" && !busy.current) {
+    if (busy.current) return;
+    const guess = currentGuess(state);
+
+    if (state.phase === "listening") {
       busy.current = true;
       setMascot("listening");
       (async () => {
-        const transcript = await listenAndTranscribe();
-        setKidLine(transcript);
-        busy.current = false;
-        dispatch({ type: "UTTERANCE_CAPTURED", transcript });
+        try {
+          const transcript = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS);
+          setKidLine(transcript);
+          dispatch({ type: "UTTERANCE_CAPTURED", transcript });
+        } catch {
+          dispatch({ type: "RESET" });
+        } finally {
+          busy.current = false;
+        }
       })();
     }
 
-    if (state.phase === "thinking" && !busy.current) {
+    if (state.phase === "thinking") {
       busy.current = true;
       setMascot("thinking");
       (async () => {
-        let target = state.target!;
         try {
-          const inferred = await inferAnimal(state.transcript);
-          target = animalByName(inferred) ?? state.target!;
-        } catch { /* fall back to the picked card */ }
-        const plan = planGuessSequence(target);
-        busy.current = false;
-        dispatch({ type: "PLAN_READY", plan });
+          let target = state.target!;
+          try {
+            const inferred = await withTimeout(inferAnimal(state.transcript), PHASE_TIMEOUT_MS);
+            target = animalByName(inferred) ?? state.target!;
+          } catch { /* inference failed — fall back to the picked card */ }
+          dispatch({ type: "PLAN_READY", plan: planGuessSequence(target) });
+        } catch {
+          dispatch({ type: "RESET" });
+        } finally {
+          busy.current = false;
+        }
       })();
     }
 
-    if (state.phase === "guessing" && !busy.current) {
+    if (state.phase === "guessing" && guess) {
       busy.current = true;
-      const guess = state.currentGuess!;
       const isLast = state.guessIndex === state.plan.length - 1;
       const line = isLast ? `Then it must be a ${guess.name}! ${guess.emoji}` : `Hmm… is it a ${guess.name}? ${guess.emoji}`;
       setAiLine(line);
       setMascot("talking");
       (async () => {
-        await speak(line);
-        setMascot("idle");
-        busy.current = false;
-        dispatch({ type: "GUESS_SPOKEN" });
+        try {
+          await withTimeout(speak(line), PHASE_TIMEOUT_MS);
+          dispatch({ type: "GUESS_SPOKEN" });
+        } catch {
+          dispatch({ type: "RESET" });
+        } finally {
+          setMascot("idle");
+          busy.current = false;
+        }
       })();
     }
 
-    if (state.phase === "awaiting" && !busy.current) {
+    if (state.phase === "awaiting") {
       busy.current = true;
       setMascot("listening");
+      const isCorrect = !!guess && guess.id === state.target?.id;
       (async () => {
-        const transcript = await listenAndTranscribe();
-        setKidLine(transcript);
-        let cmd = matchCommand(transcript);
-        if (cmd === "unknown") cmd = (await classifyCommand(transcript)) as any;
-        busy.current = false;
-        dispatch({ type: "COMMAND", command: cmd });
+        try {
+          for (let attempt = 0; attempt < MAX_AWAIT_RETRIES; attempt++) {
+            const transcript = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS);
+            setKidLine(transcript);
+            let cmd: Command = matchCommand(transcript);
+            if (cmd === "unknown") {
+              try { cmd = (await withTimeout(classifyCommand(transcript), PHASE_TIMEOUT_MS)) as Command; }
+              catch { cmd = "unknown"; }
+            }
+            // Only "try again", or "yes" on the CORRECT guess, advances the game.
+            if (cmd === "try_again" || (cmd === "confirm" && isCorrect)) {
+              dispatch({ type: "COMMAND", command: cmd });
+              return;
+            }
+            // Unrecognized / confirm-on-wrong: re-prompt and listen again.
+            const reprompt = isCorrect ? "Say 'Yes, it is!' if I'm right!" : "Say 'Try guessing again' to hear another guess!";
+            setMascot("talking");
+            await withTimeout(speak(reprompt), PHASE_TIMEOUT_MS).catch(() => {});
+            setMascot("listening");
+          }
+          dispatch({ type: "RESET" }); // exhausted retries — reset for the next child
+        } catch {
+          dispatch({ type: "RESET" });
+        } finally {
+          busy.current = false;
+        }
       })();
     }
   }, [state.phase, state.guessIndex]);
@@ -1809,7 +2035,7 @@ export default function App() {
 }
 ```
 
-> The `as any` casts bridge `useReducer`'s `(S,A)=>S` signature with our enriched return type; the runtime behavior is correct and the pure reducer remains fully tested in Task 2.4.
+> The reducer is now properly typed for `useReducer` (lazy init via `initialState`), eliminating the earlier `as any`. Every async phase is wrapped in try/finally that always clears `busy` and resets the game on failure, and each network/voice call is bounded by `withTimeout`. The `awaiting` phase re-listens (with a spoken re-prompt) on unrecognized input up to `MAX_AWAIT_RETRIES`, then resets — so the booth never freezes and never advances a wrong guess on accidental input.
 
 - [ ] **Step 2: Typecheck**
 
@@ -1875,8 +2101,9 @@ Expected: an `.exe`/`.msi` under `src-tauri/target/release/bundle/`.
 
 - [ ] **Step 2: Verify the key is not in the JS bundle**
 
-Run: `grep -r "sk-" dist/ || echo "no key in dist (good)"`
-Expected: "no key in dist (good)".
+Grep `dist/` for the **actual key value** (not a prefix guess — DashScope keys may not start with `sk-`):
+Run: `grep -rF "$BAILIAN_API_KEY" dist/ && echo "LEAK: key found in dist" || echo "no key in dist (good)"`
+Expected: "no key in dist (good)". Also confirm the key only lives in the compiled Rust binary, never in `dist/`.
 
 - [ ] **Step 3: Smoke-test the built app**
 
@@ -1915,12 +2142,25 @@ git add README.md && git commit -m "docs: build and packaging instructions"
 
 ## Self-Review (completed)
 
-- **Spec coverage:** 9 animals (2.1), hands-free voice/VAD (4.1), genuine inference constrained to 9 (3.1/7.1), deterministic wrong-then-right (2.2/2.4), command detection + LLM fallback (2.3/3.6/7.1), CosyVoice TTS (3.5), Memphis Bubblegum Pop UI + Big Stage + 4 screens (5.x), pre-generated images (6.1), Tauri v2 → dmg/exe/apk (8.x), key out of JS bundle via build.rs obfuscation (1.x, verified 8.1 Step 2). All covered.
-- **Placeholder scan:** No "TBD/implement later" steps; the ASR/TTS doc-verification steps (3.4/3.5 Step 1) are explicit verification actions with concrete fallback code, not placeholders.
-- **Type consistency:** `Animal`/`Phase`/`Command` defined once (2.1) and reused; `reduce`/`initialState`/`planGuessSequence`/`matchCommand`/`encodeWav`/`resampleTo16k`/`SilenceDetector` names match across tasks; Tauri command names (`infer_animal`, `transcribe`, `synthesize`, `classify_command`) match between 3.6 and the frontend bridge (4.3) and orchestrator (7.1).
+- **Spec coverage:** 9 animals (2.1), hands-free voice/VAD (4.1), genuine inference constrained to 9 (3.1/7.1), deterministic wrong-then-right (2.2/2.4), command detection + LLM fallback (2.3/3.6/7.1), CosyVoice WebSocket TTS (3.5), Memphis Bubblegum Pop UI + Big Stage + 4 screens (5.x), pre-generated images (6.1), Tauri v2 → dmg/exe/apk (8.x), key out of JS bundle via build.rs obfuscation (1.x, verified 8.1 Step 2), resilience/watchdog (7.1). All covered.
+- **Placeholder scan:** No "TBD/implement later" steps. The remaining "verify" steps (3.4/3.5 Step 1) are narrow model-id/voice-id confirmations against the console; the full WebSocket protocol shape is now concrete from the documented API.
+- **Type consistency:** `Animal`/`Phase`/`Command` defined once (2.1) and reused; `reduce` is `(GameState, Action) => GameState` with a `currentGuess` selector used consistently in tests (2.4) and the orchestrator (7.1); `initialState`/`planGuessSequence`/`matchCommand`/`encodeWav`/`resampleTo16k`/`SilenceDetector` names match across tasks; Tauri command names (`infer_animal`, `transcribe`, `synthesize`, `classify_command`) match between 3.6, the frontend bridge (4.3), and the orchestrator (7.1); the `ws::connect`/`ws::wait_for_event`/`ws::new_task_id` helpers (3.4a) are used by both asr.rs (3.4) and tts.rs (3.5).
+
+## Audit fixes applied (2026-06-03)
+
+This plan was revised after an independent audit. Changes:
+
+- **ASR & TTS rewritten as WebSocket clients (was incorrectly REST).** Web research confirmed DashScope has no synchronous clip-recognition REST endpoint (file API is async + needs a public URL) and CosyVoice is WebSocket-only. Added shared `ws.rs` helper (Task 3.4a), rewrote 3.4 (ASR) and 3.5 (TTS) with the documented run-task/finish-task protocol, binary audio frames, and added `tokio`/`tokio-tungstenite`/`futures-util`/`uuid` deps.
+- **Booth-freeze deadlock fixed (M3/M4).** Orchestrator (7.1) now wraps every async phase in try/finally that always clears `busy` and resets on error, with a `withTimeout` watchdog and an `awaiting` re-listen loop.
+- **Wrong-guess gate tightened (C3/M6).** Reducer (2.4) now advances ONLY on `try_again`; `unknown` and confirm-on-wrong are ignored (spec-aligned). Tests updated.
+- **Reducer typed properly (consistency).** `reduce` is now `(GameState, Action) => GameState`; removed all `as any` in `useReducer`; added `currentGuess` selector.
+- **VAD buffer bug fixed (C1).** Replaced `buffer.push(...input)` (RangeError risk) with an element loop; added ScriptProcessorNode deprecation note + AudioWorklet fallback (M5).
+- **Key obfuscation pad single-sourced (C2).** `build.rs` now emits the same `PAD` it encodes with.
+- **Polish:** Play screen shows the animal image thumbnail (not just emoji); key-leak grep checks the actual key value, not an `sk-` prefix.
 
 ## Known Risks
 
-- **DashScope ASR/TTS request shapes** may differ from the code in 3.4/3.5; Step 1 of each task verifies against current docs. Isolated to one function each.
+- **DashScope model/voice ids** (`paraformer-realtime-v2`, `cosyvoice-v2` + English voice) — confirm in the console (3.4/3.5 Step 1). Protocol shape is from the documented WebSocket API; only ids may need adjusting.
 - **Child-speech ASR accuracy** in a noisy room — mitigated by inference being constrained to the 9 animals and falling back to the picked card if inference fails (7.1).
-- **Tauri v2 Android tooling** maturity — Task 8.2 may need SDK/NDK setup iteration.
+- **Tauri v2 Android tooling** maturity and **ScriptProcessorNode** in the Android WebView — Task 8.2 may need SDK/NDK iteration and/or an AudioWorklet migration.
+- **Mascot fidelity:** the plan ships emoji-glyph mascot states as an MVP; richer Memphis mascot art is a follow-up quality pass against spec §Visual Design.

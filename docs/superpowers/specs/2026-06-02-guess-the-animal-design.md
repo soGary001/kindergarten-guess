@@ -99,8 +99,12 @@ A controlled pipeline is used rather than a single autonomous voice model, so
 the deliberate wrong-then-right pedagogy is guaranteed and the on-screen
 transcript is easy to render.
 
-- **ASR:** Alibaba Cloud Bailian (DashScope) real-time streaming speech
-  recognition, with voice-activity detection for turn segmentation.
+- **ASR:** Alibaba Cloud Bailian (DashScope) real-time speech recognition over
+  **WebSocket** (`paraformer-realtime-v2`). The frontend does voice-activity
+  detection to bound each utterance, then the Rust core streams that utterance's
+  audio frames to the ASR WebSocket and collects the transcript. (DashScope's
+  recorded-file REST API is async and requires a public file URL, so it is not
+  used for live booth interaction.)
 - **Inference:** Qwen LLM, prompted with the fixed list of 9 animals and asked
   to return the single best match for the child's description.
 - **Game engine:** Deterministically selects 1-2 wrong animals from the other 8
@@ -109,7 +113,12 @@ transcript is easy to render.
   state or the wrong/right sequence.
 - **Command detection:** Transcript-based intent matching for "Try guessing
   again" and "Yes, it is", with fuzzy + LLM fallback.
-- **TTS:** Bailian CosyVoice, a cheerful, kid-friendly English voice.
+- **TTS:** Bailian CosyVoice over **WebSocket** (`cosyvoice-v2`; CosyVoice is
+  WebSocket-only — HTTP POST is rejected). A cheerful, kid-friendly,
+  English-capable voice; audio returns as binary frames the webview plays.
+- **Resilience:** Every voice phase has error handling and a watchdog timeout.
+  Any network/mic/ASR/TTS failure or a stretch of unrecognized input resets the
+  booth to the attract screen so it never freezes unattended.
 
 **Connectivity:** The voice pipeline requires internet access to Bailian. The 9
 animal images are bundled and work offline; only voice interaction needs the
@@ -160,9 +169,13 @@ network.
 ## Open Decisions (deferred to implementation plan)
 
 - Exact frontend framework (React / Vue / vanilla) — does not affect this design.
-- Specific Bailian model identifiers and endpoints for ASR / LLM / TTS.
-- Exact obfuscation technique for the embedded key in the Rust core.
+- Final CosyVoice English voice id (chosen from the available voices during build).
 - Final mascot name and look.
+
+Resolved during planning: ASR/LLM/TTS endpoints and models (Paraformer-realtime-v2
+WebSocket, qwen-plus REST, cosyvoice-v2 WebSocket); key obfuscation technique
+(compile-time XOR via `build.rs`, key supplied through the `BAILIAN_API_KEY`
+environment variable so it is never in source or the JS bundle).
 
 ## Success Criteria
 
