@@ -122,6 +122,21 @@ export default function App() {
         }
       })();
     }
+
+    if (state.phase === "celebrating") {
+      busy.current = true;
+      setMascot("celebrating");
+      const name = state.target?.name ?? "it";
+      (async () => {
+        try {
+          await withTimeout(speak(`Yes! It's a ${name}! Great job!`), PHASE_TIMEOUT_MS);
+        } catch {
+          /* celebration audio is best-effort; the screen + confetti still play */
+        } finally {
+          busy.current = false;
+        }
+      })();
+    }
   }, [state.phase, state.guessIndex]);
 
   switch (state.phase) {

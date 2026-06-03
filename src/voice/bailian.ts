@@ -21,7 +21,15 @@ export async function speak(text: string): Promise<void> {
   const blob = new Blob([new Uint8Array(bytes)], { type: "audio/mpeg" });
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
-  await audio.play();
-  await new Promise<void>((res) => { audio.onended = () => res(); });
-  URL.revokeObjectURL(url);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      audio.onended = () => resolve();
+      // Corrupt/undecodable audio must reject immediately rather than hang
+      // until the orchestrator's watchdog fires.
+      audio.onerror = () => reject(new Error("audio playback failed"));
+      audio.play().catch(reject);
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }

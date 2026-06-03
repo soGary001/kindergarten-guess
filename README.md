@@ -52,7 +52,9 @@ npm run dev      # http://localhost:5173
 ```bash
 npm test                                   # frontend unit tests (Vitest)
 npx tsc --noEmit                           # type check
-BAILIAN_API_KEY=test cargo test \
+# The keystore roundtrip test asserts the built-in key equals this exact value,
+# so build the tests with it:
+BAILIAN_API_KEY=roundtrip-key-xyz cargo test \
   --manifest-path src-tauri/Cargo.toml     # Rust unit tests
 ```
 
@@ -94,3 +96,13 @@ credentials, or devices and are **not yet done**:
    `<uses-permission android:name="android.permission.RECORD_AUDIO" />` and
    `<uses-permission android:name="android.permission.INTERNET" />`.
 5. **Package** for each target and smoke-test on a clean machine / tablet.
+
+### Known follow-ups (nice-to-have, non-blocking)
+
+- **`recordUtterance` cleanup on watchdog timeout:** if the 20s phase watchdog fires
+  mid-recording, the mic stream / `AudioContext` inside `src/voice/vad.ts` aren't torn
+  down (they're freed only on normal VAD completion). Harmless on desktop; on a tablet
+  it keeps the mic active until the next capture. Consider threading an `AbortSignal`
+  into `recordUtterance` so the orchestrator can cancel it on timeout.
+- **`ScriptProcessorNode` is deprecated:** fine on desktop; verify it works in the
+  Android WebView during packaging, and migrate to `AudioWorkletNode` if not.
