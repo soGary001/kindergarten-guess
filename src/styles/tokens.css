@@ -1,0 +1,16 @@
+:root {
+  /* Bubblegum Pop */
+  --base: #FDE7F0;
+  --pink: #E84B8A;
+  --yellow: #FFD23F;
+  --sky: #7BD3EA;
+  --mint: #A0E7A0;
+  --lavender: #C3A6FF;
+  --coral: #FF6B6B;
+  --ink: #222222;
+
+  --radius: 24px;
+  --shadow-hard: 6px 6px 0 var(--ink);
+  --border: 4px solid var(--ink);
+  --font-display: "Baloo 2", "Comic Sans MS", system-ui, sans-serif;
+}
