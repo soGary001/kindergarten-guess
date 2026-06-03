@@ -1,3 +1,19 @@
+/** Linear-interpolation downsample to 16kHz. Returns input unchanged if already 16k. */
+export function resampleTo16k(samples: Float32Array, sampleRate: number): Float32Array {
+  if (sampleRate === 16000) return samples;
+  const ratio = sampleRate / 16000;
+  const outLen = Math.round(samples.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * ratio;
+    const i0 = Math.floor(pos);
+    const i1 = Math.min(i0 + 1, samples.length - 1);
+    const frac = pos - i0;
+    out[i] = samples[i0] * (1 - frac) + samples[i1] * frac;
+  }
+  return out;
+}
+
 /** Encode mono Float32 PCM (-1..1) to a 16-bit PCM WAV ArrayBuffer. */
 export function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
   const dataLen = samples.length * 2;
