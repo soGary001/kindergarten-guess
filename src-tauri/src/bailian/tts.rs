@@ -2,10 +2,16 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use super::ws;
 
-const VOICE: &str = "longxiaochun_v2"; // confirm an English-capable voice (Task 3.5 Step 1)
+// Cheerful, English-capable child voice (CosyVoice v2). Verified against the live API.
+const VOICE: &str = "longniuniu";
 
-/// Synthesizes English speech via CosyVoice WebSocket; returns concatenated MP3 bytes.
+/// Synthesizes English speech with the default child voice; returns concatenated MP3 bytes.
 pub async fn synthesize(api_key: &str, text: &str) -> Result<Vec<u8>, String> {
+    synthesize_with(api_key, text, VOICE).await
+}
+
+/// Synthesizes speech with an explicit CosyVoice v2 voice id.
+pub async fn synthesize_with(api_key: &str, text: &str, voice: &str) -> Result<Vec<u8>, String> {
     let mut socket = ws::connect(api_key, true).await?;
     let task_id = ws::new_task_id();
 
@@ -14,7 +20,7 @@ pub async fn synthesize(api_key: &str, text: &str) -> Result<Vec<u8>, String> {
         "payload": {
             "task_group": "audio", "task": "tts", "function": "SpeechSynthesizer",
             "model": "cosyvoice-v2",
-            "parameters": { "text_type": "PlainText", "voice": VOICE, "format": "mp3", "sample_rate": 22050 },
+            "parameters": { "text_type": "PlainText", "voice": voice, "format": "mp3", "sample_rate": 22050 },
             "input": {}
         }
     });
@@ -52,4 +58,25 @@ pub async fn synthesize(api_key: &str, text: &str) -> Result<Vec<u8>, String> {
     }
     if audio.is_empty() { return Err("tts returned no audio".into()); }
     Ok(audio)
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    // Live probe: BAILIAN_API_KEY=sk-... cargo test --manifest-path src-tauri/Cargo.toml \
+    //   --lib bailian::tts::live_tests -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn probe_english_child_voices() {
+        let key = std::env::var("BAILIAN_API_KEY").expect("set BAILIAN_API_KEY");
+        let candidates = ["longniuniu", "longshanshan", "longhuhu", "longpaopao", "longxiaochun_v2"];
+        let text = "Yes! It's an elephant! Great job!";
+        for v in candidates {
+            match synthesize_with(&key, text, v).await {
+                Ok(bytes) => println!("VOICE {v}: OK, {} bytes mp3", bytes.len()),
+                Err(e) => println!("VOICE {v}: FAILED -> {e}"),
+            }
+        }
+    }
 }
