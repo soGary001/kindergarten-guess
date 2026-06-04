@@ -1,10 +1,8 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { initialState, reduce, currentGuess } from "./game/machine";
 import { planGuessSequence } from "./game/guessing";
-import { matchCommand } from "./game/commands";
 import { animalByName } from "./game/animals";
-import type { Command } from "./game/types";
-import { listenAndTranscribe, inferAnimal, classifyCommand, speak, unlockAudio } from "./voice/bailian";
+import { listenAndTranscribe, inferAnimal, speak, unlockAudio } from "./voice/bailian";
 import { AttractScreen } from "./screens/AttractScreen";
 import { PickScreen } from "./screens/PickScreen";
 import { PlayScreen, type Msg } from "./screens/PlayScreen";
@@ -12,7 +10,6 @@ import { CelebrationScreen } from "./screens/CelebrationScreen";
 import type { MascotState } from "./components/Mascot";
 
 const PHASE_TIMEOUT_MS = 20000;  // watchdog: no single voice phase may hang longer than this
-const MAX_AWAIT_RETRIES = 3;     // unrecognized replies before resetting for the next child
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
@@ -95,29 +92,14 @@ export default function App() {
       const isCorrect = !!guess && guess.id === state.target?.id;
       (async () => {
         try {
-          for (let attempt = 0; attempt < MAX_AWAIT_RETRIES; attempt++) {
-            const transcript = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS);
-            addMsg("kid", transcript);
-            let cmd: Command = matchCommand(transcript);
-            if (cmd === "unknown") {
-              try { cmd = (await withTimeout(classifyCommand(transcript), PHASE_TIMEOUT_MS)) as Command; }
-              catch { cmd = "unknown"; }
-            }
-            // Only "try again", or "yes" on the CORRECT guess, advances the game.
-            if (cmd === "try_again" || (cmd === "confirm" && isCorrect)) {
-              dispatch({ type: "COMMAND", command: cmd });
-              return;
-            }
-            // Unrecognized / confirm-on-wrong: re-prompt and listen again.
-            const reprompt = isCorrect ? "Say 'Yes, it is!' if I'm right!" : "Say 'Try guessing again' to hear another guess!";
-            addMsg("ai", reprompt);
-            setMascot("talking");
-            await withTimeout(speak(reprompt), PHASE_TIMEOUT_MS).catch(() => {});
-            setMascot("listening");
-          }
-          dispatch({ type: "RESET" }); // exhausted retries — reset for the next child
+          // Natural turn-taking: just let the child speak. No scripted "say X" prompts.
+          const transcript = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS);
+          addMsg("kid", transcript);
+          // On the correct guess, the child's reply confirms it → celebrate.
+          // On a wrong guess, whatever they say means "keep going" → next guess.
+          dispatch({ type: "COMMAND", command: isCorrect ? "confirm" : "try_again" });
         } catch {
-          dispatch({ type: "RESET" });
+          dispatch({ type: "RESET" }); // no speech / timeout → reset for the next child
         } finally {
           busy.current = false;
         }
