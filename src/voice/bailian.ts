@@ -16,8 +16,22 @@ export function classifyCommand(transcript: string): Promise<string> {
   return invoke<string>("classify_command", { transcript });
 }
 
+/**
+ * Keep only English letters, digits, and safe punctuation before sending to TTS.
+ * Emoji and any non-Latin characters are dropped so the voice never reads them
+ * aloud in Chinese (e.g. an elephant emoji being voiced as "大象").
+ */
+export function toEnglishSpeech(text: string): string {
+  return text
+    .replace(/[^A-Za-z0-9 .,!?'’\-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export async function speak(text: string): Promise<void> {
-  const bytes = await invoke<number[]>("synthesize", { text });
+  const clean = toEnglishSpeech(text);
+  if (!clean) return; // nothing speakable
+  const bytes = await invoke<number[]>("synthesize", { text: clean });
   const blob = new Blob([new Uint8Array(bytes)], { type: "audio/mpeg" });
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);

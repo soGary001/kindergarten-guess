@@ -7,7 +7,7 @@ import type { Command } from "./game/types";
 import { listenAndTranscribe, inferAnimal, classifyCommand, speak } from "./voice/bailian";
 import { AttractScreen } from "./screens/AttractScreen";
 import { PickScreen } from "./screens/PickScreen";
-import { PlayScreen } from "./screens/PlayScreen";
+import { PlayScreen, type Msg } from "./screens/PlayScreen";
 import { CelebrationScreen } from "./screens/CelebrationScreen";
 import type { MascotState } from "./components/Mascot";
 
@@ -24,10 +24,10 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 export default function App() {
   // reduce is a pure (GameState, Action) => GameState, so useReducer is fully typed — no casts.
   const [state, dispatch] = useReducer(reduce, undefined, initialState);
-  const [kidLine, setKidLine] = useState<string | null>(null);
-  const [aiLine, setAiLine] = useState<string | null>(null);
+  const [messages, setMessages] = useState<Msg[]>([]);
   const [mascot, setMascot] = useState<MascotState>("idle");
   const busy = useRef(false);
+  const addMsg = (who: Msg["who"], text: string) => setMessages((m) => [...m, { who, text }]);
 
   // Drive side effects off phase transitions. Every branch resets `busy` in finally and
   // resets the game on failure, so a network/mic/ASR/TTS error can never freeze the booth.
@@ -41,7 +41,7 @@ export default function App() {
       (async () => {
         try {
           const transcript = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS);
-          setKidLine(transcript);
+          addMsg("kid", transcript);
           dispatch({ type: "UTTERANCE_CAPTURED", transcript });
         } catch {
           dispatch({ type: "RESET" });
@@ -74,7 +74,7 @@ export default function App() {
       busy.current = true;
       const isLast = state.guessIndex === state.plan.length - 1;
       const line = isLast ? `Then it must be a ${guess.name}! ${guess.emoji}` : `Hmm… is it a ${guess.name}? ${guess.emoji}`;
-      setAiLine(line);
+      addMsg("ai", line); // emoji shown on screen; speak() strips it so the voice stays English
       setMascot("talking");
       (async () => {
         try {
@@ -97,7 +97,7 @@ export default function App() {
         try {
           for (let attempt = 0; attempt < MAX_AWAIT_RETRIES; attempt++) {
             const transcript = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS);
-            setKidLine(transcript);
+            addMsg("kid", transcript);
             let cmd: Command = matchCommand(transcript);
             if (cmd === "unknown") {
               try { cmd = (await withTimeout(classifyCommand(transcript), PHASE_TIMEOUT_MS)) as Command; }
@@ -110,6 +110,7 @@ export default function App() {
             }
             // Unrecognized / confirm-on-wrong: re-prompt and listen again.
             const reprompt = isCorrect ? "Say 'Yes, it is!' if I'm right!" : "Say 'Try guessing again' to hear another guess!";
+            addMsg("ai", reprompt);
             setMascot("talking");
             await withTimeout(speak(reprompt), PHASE_TIMEOUT_MS).catch(() => {});
             setMascot("listening");
@@ -127,9 +128,11 @@ export default function App() {
       busy.current = true;
       setMascot("celebrating");
       const name = state.target?.name ?? "it";
+      const celebrate = `Yes! It's a ${name}! Great job!`;
+      addMsg("ai", celebrate);
       (async () => {
         try {
-          await withTimeout(speak(`Yes! It's a ${name}! Great job!`), PHASE_TIMEOUT_MS);
+          await withTimeout(speak(celebrate), PHASE_TIMEOUT_MS);
         } catch {
           /* celebration audio is best-effort; the screen + confetti still play */
         } finally {
@@ -141,7 +144,7 @@ export default function App() {
 
   switch (state.phase) {
     case "attract":
-      return <AttractScreen onStart={() => { setKidLine(null); setAiLine(null); dispatch({ type: "START" }); }} />;
+      return <AttractScreen onStart={() => { setMessages([]); dispatch({ type: "START" }); }} />;
     case "picking":
       return <PickScreen onPick={(a) => dispatch({ type: "PICK", animal: a })} />;
     case "celebrating":
@@ -151,8 +154,7 @@ export default function App() {
         <PlayScreen
           target={state.target!}
           mascot={mascot}
-          aiLine={aiLine}
-          kidLine={kidLine}
+          messages={messages}
           orbActive={mascot === "listening"}
           orbLabel={mascot === "listening" ? "I'm listening…" : mascot === "thinking" ? "Bibo is thinking…" : "Bibo is talking…"}
         />
