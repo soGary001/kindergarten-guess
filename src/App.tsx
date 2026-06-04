@@ -4,7 +4,7 @@ import { planGuessSequence } from "./game/guessing";
 import { matchCommand } from "./game/commands";
 import { animalByName } from "./game/animals";
 import type { Command } from "./game/types";
-import { listenAndTranscribe, inferAnimal, classifyCommand, speak } from "./voice/bailian";
+import { listenAndTranscribe, inferAnimal, classifyCommand, speak, unlockAudio } from "./voice/bailian";
 import { AttractScreen } from "./screens/AttractScreen";
 import { PickScreen } from "./screens/PickScreen";
 import { PlayScreen, type Msg } from "./screens/PlayScreen";
@@ -144,7 +144,7 @@ export default function App() {
 
   switch (state.phase) {
     case "attract":
-      return <AttractScreen onStart={() => { setMessages([]); dispatch({ type: "START" }); }} />;
+      return <AttractScreen onStart={() => { setMessages([]); unlockAudio(); dispatch({ type: "START" }); }} />;
     case "picking":
       return <PickScreen onPick={(a) => dispatch({ type: "PICK", animal: a })} />;
     case "celebrating":
