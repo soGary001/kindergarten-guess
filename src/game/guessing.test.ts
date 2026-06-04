@@ -9,11 +9,11 @@ test("plan ends with the correct animal", () => {
   expect(seq[seq.length - 1].id).toBe("elephant");
 });
 
-test("plan has 1 or 2 wrong guesses before the correct one", () => {
+test("plan has 2 or 3 wrong guesses before the correct one", () => {
   const seq = planGuessSequence(target, () => 0);
   const wrongCount = seq.length - 1;
-  expect(wrongCount).toBeGreaterThanOrEqual(1);
-  expect(wrongCount).toBeLessThanOrEqual(2);
+  expect(wrongCount).toBeGreaterThanOrEqual(2);
+  expect(wrongCount).toBeLessThanOrEqual(3);
 });
 
 test("wrong guesses are never the target and never repeat", () => {
@@ -23,7 +23,7 @@ test("wrong guesses are never the target and never repeat", () => {
   expect(new Set(wrongs.map((a) => a.id)).size).toBe(wrongs.length);
 });
 
-test("rng controls the number of wrong guesses", () => {
-  expect(planGuessSequence(target, () => 0.1)).toHaveLength(2);
-  expect(planGuessSequence(target, () => 0.9)).toHaveLength(3);
+test("rng controls the number of wrong guesses (2 wrong -> len 3, 3 wrong -> len 4)", () => {
+  expect(planGuessSequence(target, () => 0.1)).toHaveLength(3);
+  expect(planGuessSequence(target, () => 0.9)).toHaveLength(4);
 });

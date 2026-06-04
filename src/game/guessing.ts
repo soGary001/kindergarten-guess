@@ -6,7 +6,8 @@ export function planGuessSequence(
   target: Animal,
   rng: () => number = Math.random,
 ): Animal[] {
-  const wrongCount = rng() < 0.5 ? 1 : 2;
+  // 2 or 3 wrong guesses, so the AI lands the answer on roughly the 3rd–4th round.
+  const wrongCount = rng() < 0.5 ? 2 : 3;
   const pool = ANIMALS.filter((a) => a.id !== target.id);
 
   const wrongs: Animal[] = [];
