@@ -7,11 +7,11 @@ export interface Animal {
 
 export type Phase =
   | "attract"
-  | "picking"
-  | "listening"   // recording the child
+  | "describing"  // listening to the child describe the current animal
   | "thinking"    // ASR + inference running
   | "guessing"    // Bibo is speaking a guess
-  | "awaiting"    // waiting for "try again" / "yes it is"
-  | "celebrating";
+  | "awaiting"    // waiting for "yes" / more description
+  | "revealing"   // correct! show the animal image, then start a fresh round
+  | "results";    // 60s up — show the score
 
 export type Command = "try_again" | "confirm" | "unknown";

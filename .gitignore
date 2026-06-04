@@ -2,3 +2,5 @@
 node_modules/
 target/
 dist/
+installers/
+.DS_Store

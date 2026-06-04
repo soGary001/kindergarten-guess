@@ -1,59 +1,64 @@
-import type { Animal, Command, Phase } from "./types";
+import type { Animal, Phase } from "./types";
 
 export interface GameState {
   phase: Phase;
-  target: Animal | null;
-  transcript: string;
-  plan: Animal[];      // wrong... then correct
-  guessIndex: number;  // index into plan of the current/last guess
+  description: string;   // accumulated description of the CURRENT animal this round
+  guess: Animal | null;  // the AI's current guess awaiting confirmation
+  guessedIds: string[];  // animal ids already guessed this round (excluded on retry)
+  score: number;         // animals correctly guessed this game
 }
 
 export type Action =
   | { type: "START" }
-  | { type: "PICK"; animal: Animal }
-  | { type: "UTTERANCE_CAPTURED"; transcript: string }
-  | { type: "PLAN_READY"; plan: Animal[] }
-  | { type: "GUESS_SPOKEN" }
-  | { type: "COMMAND"; command: Command }
-  | { type: "RESET" };
+  | { type: "DESCRIBED"; text: string }   // child finished describing -> infer
+  | { type: "GUESS"; animal: Animal }      // AI has an inference -> speak it
+  | { type: "GUESS_SPOKEN" }               // AI finished speaking the guess
+  | { type: "CORRECT" }                    // child confirmed -> score + reveal image
+  | { type: "NEXT" }                       // reveal done -> fresh round, next animal
+  | { type: "RETRY"; text: string }        // child said no / more -> re-infer
+  | { type: "TIME_UP" }                    // 60s countdown expired
+  | { type: "RESET" };                     // back to attract
 
 export function initialState(): GameState {
-  return { phase: "attract", target: null, transcript: "", plan: [], guessIndex: -1 };
+  return { phase: "attract", description: "", guess: null, guessedIds: [], score: 0 };
 }
 
-/** Selector for the current/last guess. Use this instead of stashing it on state. */
-export function currentGuess(s: GameState): Animal | null {
-  return s.guessIndex >= 0 ? s.plan[s.guessIndex] ?? null : null;
+const PLAY_PHASES: readonly Phase[] = ["describing", "thinking", "guessing", "awaiting", "revealing"];
+export function isPlaying(p: Phase): boolean {
+  return PLAY_PHASES.includes(p);
 }
 
-/** Pure reducer: (GameState, Action) => GameState — directly usable with useReducer. */
+/**
+ * Pure reducer. Play actions are guarded by the expected phase so a voice
+ * result that resolves late (e.g. after TIME_UP) can never resurrect the game.
+ */
 export function reduce(state: GameState, action: Action): GameState {
   switch (action.type) {
     case "RESET":
       return initialState();
     case "START":
-      return { ...initialState(), phase: "picking" };
-    case "PICK":
-      return { ...state, phase: "listening", target: action.animal };
-    case "UTTERANCE_CAPTURED":
-      return { ...state, phase: "thinking", transcript: action.transcript };
-    case "PLAN_READY":
-      return { ...state, phase: "guessing", plan: action.plan, guessIndex: 0 };
+      return { phase: "describing", description: "", guess: null, guessedIds: [], score: 0 };
+    case "TIME_UP":
+      return isPlaying(state.phase) ? { ...state, phase: "results" } : state;
+    case "DESCRIBED":
+      if (state.phase !== "describing") return state;
+      return { ...state, phase: "thinking", description: `${state.description} ${action.text}`.trim() };
+    case "GUESS":
+      if (state.phase !== "thinking") return state;
+      return { ...state, phase: "guessing", guess: action.animal, guessedIds: [...state.guessedIds, action.animal.id] };
     case "GUESS_SPOKEN":
+      if (state.phase !== "guessing") return state;
       return { ...state, phase: "awaiting" };
-    case "COMMAND": {
-      const cur = currentGuess(state);
-      const isCorrect = !!cur && !!state.target && cur.id === state.target.id;
-      if (action.command === "confirm" && isCorrect) {
-        return { ...state, phase: "celebrating" };
-      }
-      if (action.command === "try_again") {
-        const next = Math.min(state.guessIndex + 1, state.plan.length - 1);
-        return { ...state, phase: "guessing", guessIndex: next };
-      }
-      // confirm-on-wrong or unknown: ignore — stay awaiting.
-      return state;
-    }
+    case "CORRECT":
+      if (state.phase !== "awaiting") return state;
+      // Keep `guess` (the confirmed animal) so the reveal screen can show its image.
+      return { ...state, phase: "revealing", score: state.score + 1 };
+    case "NEXT":
+      if (state.phase !== "revealing") return state;
+      return { ...state, phase: "describing", description: "", guess: null, guessedIds: [] };
+    case "RETRY":
+      if (state.phase !== "awaiting") return state;
+      return { ...state, phase: "thinking", description: `${state.description} ${action.text}`.trim(), guess: null };
     default:
       return state;
   }

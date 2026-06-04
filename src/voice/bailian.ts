@@ -21,8 +21,8 @@ export async function listenAndTranscribe(): Promise<string> {
   return invoke<string>("transcribe", { wav: Array.from(new Uint8Array(wav)) });
 }
 
-export function inferAnimal(transcript: string): Promise<string> {
-  return invoke<string>("infer_animal", { transcript });
+export function inferAnimal(transcript: string, excluded: string[] = []): Promise<string> {
+  return invoke<string>("infer_animal", { transcript, excluded });
 }
 
 export function classifyCommand(transcript: string): Promise<string> {

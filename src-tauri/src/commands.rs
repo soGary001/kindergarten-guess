@@ -1,8 +1,8 @@
 use crate::{bailian, keystore};
 
 #[tauri::command]
-pub async fn infer_animal(transcript: String) -> Result<String, String> {
-    bailian::llm::infer_animal(&keystore::api_key(), &transcript).await
+pub async fn infer_animal(transcript: String, excluded: Vec<String>) -> Result<String, String> {
+    bailian::llm::infer_animal(&keystore::api_key(), &transcript, &excluded).await
 }
 
 #[tauri::command]

@@ -5,13 +5,20 @@ const ANIMALS: [&str; 9] = [
 ];
 
 /// Builds the chat-completions request body that constrains the model to the 9 animals.
-pub fn build_llm_request(transcript: &str) -> Value {
-    let system = format!(
+/// `excluded` lists animal names already guessed wrong this round — the model must avoid them.
+pub fn build_llm_request(transcript: &str, excluded: &[String]) -> Value {
+    let mut system = format!(
         "You are helping a kindergarten English game. The child describes ONE of these \
          animals: {}. Read the child's description and reply with ONLY the single best-matching \
          animal name from that list, exactly as written, with no other words.",
         ANIMALS.join(", ")
     );
+    if !excluded.is_empty() {
+        system.push_str(&format!(
+            " Do NOT answer with any of these (already guessed and wrong): {}.",
+            excluded.join(", ")
+        ));
+    }
     serde_json::json!({
         "model": "qwen-plus",
         "messages": [
@@ -36,12 +43,12 @@ pub fn parse_llm_response(body: &Value) -> Option<String> {
         .map(|a| a.to_string())
 }
 
-pub async fn infer_animal(api_key: &str, transcript: &str) -> Result<String, String> {
+pub async fn infer_animal(api_key: &str, transcript: &str, excluded: &[String]) -> Result<String, String> {
     let client = reqwest::Client::new();
     let resp = client
         .post("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
         .bearer_auth(api_key)
-        .json(&build_llm_request(transcript))
+        .json(&build_llm_request(transcript, excluded))
         .send()
         .await
         .map_err(|e| format!("llm request failed: {e}"))?;
@@ -55,10 +62,18 @@ mod tests {
 
     #[test]
     fn request_lists_all_animals_and_pins_model() {
-        let body = build_llm_request("It's big. It has a long nose.");
+        let body = build_llm_request("It's big. It has a long nose.", &[]);
         assert_eq!(body["model"], "qwen-plus");
         let sys = body["messages"][0]["content"].as_str().unwrap();
         for a in ANIMALS { assert!(sys.contains(a), "system prompt missing {a}"); }
+    }
+
+    #[test]
+    fn excluded_animals_are_named_in_the_prompt() {
+        let body = build_llm_request("it is big", &["Snake".to_string(), "Tiger".to_string()]);
+        let sys = body["messages"][0]["content"].as_str().unwrap();
+        assert!(sys.contains("Do NOT answer"));
+        assert!(sys.contains("Snake") && sys.contains("Tiger"));
     }
 
     #[test]
