@@ -9,7 +9,7 @@ import { PlayScreen, type Msg } from "./screens/PlayScreen";
 import { ResultsScreen } from "./screens/ResultsScreen";
 import type { MascotState } from "./components/Mascot";
 
-const GAME_SECONDS = 60;
+const GAME_SECONDS = 90;
 const PHASE_TIMEOUT_MS = 20000; // watchdog so a single voice call can't hang forever
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -196,6 +196,7 @@ export default function App() {
       score={state.score}
       secondsLeft={secondsLeft}
       reveal={state.phase === "revealing" ? state.guess : null}
+      onQuit={goHome}
       orbActive={mascot === "listening"}
       orbLabel={mascot === "listening" ? "Listening…" : mascot === "thinking" ? "Bibo is thinking…" : "Bibo is talking…"}
     />

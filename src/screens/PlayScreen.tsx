@@ -18,10 +18,11 @@ export function PlayScreen(props: {
   score: number;
   secondsLeft: number;
   reveal: Animal | null;
+  onQuit: () => void;
   orbActive: boolean;
   orbLabel: string;
 }) {
-  const { mascot, messages, score, secondsLeft, reveal, orbActive, orbLabel } = props;
+  const { mascot, messages, score, secondsLeft, reveal, onQuit, orbActive, orbLabel } = props;
   const endRef = useRef<HTMLDivElement>(null);
   const low = secondsLeft <= 10;
 
@@ -39,9 +40,25 @@ export function PlayScreen(props: {
     <div className="screen" style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
       <MemphisBackground />
 
-      {/* HUD: score (left) + countdown (right) */}
+      {/* HUD: home + score (left), mascot (center), countdown (right) */}
       <div style={{ zIndex: 2, width: "min(960px, 94vw)", display: "flex", justifyContent: "space-between", alignItems: "center", paddingTop: 16 }}>
-        <div style={pill("var(--pink)")}>⭐ {score}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <button
+            onClick={onQuit}
+            aria-label="Back to home"
+            title="Back to home"
+            style={{
+              width: 58, height: 58, borderRadius: "50%", background: "var(--yellow)",
+              border: "4px solid var(--ink)", boxShadow: "4px 4px 0 var(--ink)", cursor: "pointer",
+              fontSize: 28, lineHeight: 1, display: "grid", placeItems: "center", padding: 0,
+            }}
+            onMouseDown={(e) => { e.currentTarget.style.transform = "translate(3px,3px)"; e.currentTarget.style.boxShadow = "1px 1px 0 var(--ink)"; }}
+            onMouseUp={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "4px 4px 0 var(--ink)"; }}
+          >
+            🏠
+          </button>
+          <div style={pill("var(--pink)")}>⭐ {score}</div>
+        </div>
         <Mascot state={mascot} size={72} />
         <div style={{ ...pill(low ? "var(--coral)" : "var(--sky)"), color: low ? "#fff" : "#063", animation: low ? "float .5s ease-in-out infinite" : undefined }}>
           ⏱ {fmt(secondsLeft)}
