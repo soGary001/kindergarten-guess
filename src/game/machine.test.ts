@@ -1,77 +1,67 @@
 import { expect, test } from "vitest";
-import { initialState, reduce } from "./machine";
+import { initialState, reduce, currentGuess } from "./machine";
 import { animalByName } from "./animals";
 
 const elephant = animalByName("Elephant")!;
 const snake = animalByName("Snake")!;
+const tiger = animalByName("Tiger")!;
+const plan = [snake, tiger, elephant]; // 2 wrong, then the drawn target
 
 test("starts in attract", () => {
   expect(initialState().phase).toBe("attract");
 });
 
-test("START begins a round in describing with a fresh score", () => {
+test("START enters drawing with a fresh score and no drawn animals", () => {
   const s = reduce(initialState(), { type: "START" });
-  expect(s.phase).toBe("describing");
+  expect(s.phase).toBe("drawing");
   expect(s.score).toBe(0);
-  expect(s.description).toBe("");
+  expect(s.drawnIds).toEqual([]);
 });
 
-test("happy round: describe -> guess -> confirm -> reveal (score++) -> next clears the round", () => {
+test("full round: draw -> go -> describe -> 2 wrong -> correct -> reveal -> next draw", () => {
   let s = reduce(initialState(), { type: "START" });
 
-  s = reduce(s, { type: "DESCRIBED", text: "It's big. It has a long nose." });
-  expect(s.phase).toBe("thinking");
-  expect(s.description).toContain("long nose");
+  s = reduce(s, { type: "DRAW", target: elephant, plan });
+  expect(s.phase).toBe("drawing");      // card shown, timer still paused
+  expect(s.target?.id).toBe("elephant");
+  expect(s.drawnIds).toEqual(["elephant"]);
 
-  s = reduce(s, { type: "GUESS", animal: elephant });
+  s = reduce(s, { type: "GO" });
+  expect(s.phase).toBe("describing");   // timer resumes
+
+  s = reduce(s, { type: "DESCRIBED" });
   expect(s.phase).toBe("guessing");
-  expect(s.guess?.id).toBe("elephant");
-  expect(s.guessedIds).toEqual(["elephant"]);
+  expect(currentGuess(s)?.id).toBe("snake"); // first wrong guess
 
   s = reduce(s, { type: "GUESS_SPOKEN" });
-  expect(s.phase).toBe("awaiting");
+  s = reduce(s, { type: "NEXT_GUESS" });
+  expect(currentGuess(s)?.id).toBe("tiger"); // second wrong guess
 
+  s = reduce(s, { type: "GUESS_SPOKEN" });
+  s = reduce(s, { type: "NEXT_GUESS" });
+  expect(currentGuess(s)?.id).toBe("elephant"); // the target
+
+  s = reduce(s, { type: "GUESS_SPOKEN" });
   s = reduce(s, { type: "CORRECT" });
-  expect(s.phase).toBe("revealing"); // show the animal image first
+  expect(s.phase).toBe("revealing");
   expect(s.score).toBe(1);
-  expect(s.guess?.id).toBe("elephant"); // kept so the reveal can show it
 
   s = reduce(s, { type: "NEXT" });
-  expect(s.phase).toBe("describing"); // fresh conversation for the next animal
-  expect(s.description).toBe("");
-  expect(s.guess).toBeNull();
-  expect(s.guessedIds).toEqual([]);
+  expect(s.phase).toBe("drawing");      // draw the next animal, paused again
+  expect(s.target).toBeNull();
+  expect(s.drawnIds).toEqual(["elephant"]); // remembered so it won't repeat
 });
 
-test("wrong guess: RETRY accumulates description and remembers the wrong guess", () => {
+test("TIME_UP ends the game and ignores late round actions", () => {
   let s = reduce(initialState(), { type: "START" });
-  s = reduce(s, { type: "DESCRIBED", text: "It is big." });
-  s = reduce(s, { type: "GUESS", animal: snake });
-  s = reduce(s, { type: "GUESS_SPOKEN" });
-
-  s = reduce(s, { type: "RETRY", text: "It has a long nose." });
-  expect(s.phase).toBe("thinking");
-  expect(s.guess).toBeNull();
-  expect(s.guessedIds).toEqual(["snake"]); // remembered, so we won't repeat it
-  expect(s.description).toBe("It is big. It has a long nose.");
-
-  s = reduce(s, { type: "GUESS", animal: elephant });
-  expect(s.guessedIds).toEqual(["snake", "elephant"]);
-});
-
-test("TIME_UP ends the game from any play phase; late actions are ignored after", () => {
-  let s = reduce(initialState(), { type: "START" });
-  s = reduce(s, { type: "DESCRIBED", text: "big nose" }); // thinking
+  s = reduce(s, { type: "DRAW", target: elephant, plan });
+  s = reduce(s, { type: "GO" });
   s = reduce(s, { type: "TIME_UP" });
   expect(s.phase).toBe("results");
-
-  // A voice result resolving late must NOT resurrect the game.
-  const after = reduce(s, { type: "GUESS", animal: elephant });
-  expect(after.phase).toBe("results");
+  expect(reduce(s, { type: "DESCRIBED" }).phase).toBe("results");
 });
 
 test("RESET returns to attract", () => {
   let s = reduce(initialState(), { type: "START" });
-  s = reduce(s, { type: "RESET" });
-  expect(s.phase).toBe("attract");
+  expect(reduce(s, { type: "RESET" }).phase).toBe("attract");
 });

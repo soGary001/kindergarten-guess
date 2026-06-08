@@ -1,10 +1,9 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { initialState, reduce, isPlaying } from "./game/machine";
-import { ANIMALS, animalByName } from "./game/animals";
-import { matchCommand } from "./game/commands";
-import type { Animal, Command } from "./game/types";
-import { listenAndTranscribe, inferAnimal, classifyCommand, speak, unlockAudio } from "./voice/bailian";
+import { initialState, reduce, currentGuess, isCounting } from "./game/machine";
+import { drawAnimal, buildGuessPlan } from "./game/draw";
+import { listenAndTranscribe, speak, unlockAudio } from "./voice/bailian";
 import { AttractScreen } from "./screens/AttractScreen";
+import { DrawScreen } from "./screens/DrawScreen";
 import { PlayScreen, type Msg } from "./screens/PlayScreen";
 import { ResultsScreen } from "./screens/ResultsScreen";
 import type { MascotState } from "./components/Mascot";
@@ -19,8 +18,11 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
-const namesFromIds = (ids: string[]) =>
-  ids.map((id) => ANIMALS.find((a) => a.id === id)?.name).filter((n): n is string => !!n);
+/** Draw the next un-drawn animal and its guess plan, or null when all 9 are used. */
+function nextDraw(drawnIds: string[]) {
+  const target = drawAnimal(drawnIds);
+  return target ? { target, plan: buildGuessPlan(target) } : null;
+}
 
 export default function App() {
   const [state, dispatch] = useReducer(reduce, undefined, initialState);
@@ -28,15 +30,19 @@ export default function App() {
   const [mascot, setMascot] = useState<MascotState>("idle");
   const [secondsLeft, setSecondsLeft] = useState(GAME_SECONDS);
   const busy = useRef(false);
-  const playing = useRef(false);     // true between START and TIME_UP/RESET
-  const deadline = useRef<number | null>(null);
+  const playing = useRef(false);          // true between START and TIME_UP/RESET
+  const remaining = useRef(GAME_SECONDS * 1000); // ms left; only decremented in counting phases
   const addMsg = (who: Msg["who"], text: string) => setMessages((m) => [...m, { who, text }]);
 
-  // 60s countdown, driven off an absolute deadline so phase changes don't drift it.
+  // Countdown — runs ONLY during counting phases (paused while drawing), using real deltas.
   useEffect(() => {
-    if (!isPlaying(state.phase)) return;
+    if (!isCounting(state.phase)) return;
+    let last = Date.now();
     const id = setInterval(() => {
-      const left = deadline.current ? Math.max(0, Math.ceil((deadline.current - Date.now()) / 1000)) : 0;
+      const now = Date.now();
+      remaining.current -= now - last;
+      last = now;
+      const left = Math.max(0, Math.ceil(remaining.current / 1000));
       setSecondsLeft(left);
       if (left <= 0) {
         playing.current = false;
@@ -46,8 +52,8 @@ export default function App() {
     return () => clearInterval(id);
   }, [state.phase]);
 
-  // Voice/game loop, driven off phase transitions. `busy` guards re-entry (and StrictMode
-  // double-invoke); `playing` lets in-flight listens bail out when the clock runs out.
+  // Voice/game loop. `busy` guards re-entry (and StrictMode double-invoke); `playing`
+  // lets in-flight listens bail out when the clock runs out.
   useEffect(() => {
     if (busy.current) return;
 
@@ -59,11 +65,11 @@ export default function App() {
           let text = "";
           while (playing.current && !text) {
             try { text = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS); }
-            catch { text = ""; } // no speech yet — keep listening until the clock stops us
+            catch { text = ""; }
           }
           if (text && playing.current) {
             addMsg("kid", text);
-            dispatch({ type: "DESCRIBED", text });
+            dispatch({ type: "DESCRIBED" });
           }
         } finally {
           busy.current = false;
@@ -71,47 +77,17 @@ export default function App() {
       })();
     }
 
-    if (state.phase === "thinking") {
+    if (state.phase === "guessing") {
+      const g = currentGuess(state);
+      if (!g) return;
       busy.current = true;
-      setMascot("thinking");
-      const guessedIds = state.guessedIds;
-      const excluded = namesFromIds(guessedIds);
-      const description = state.description;
-      (async () => {
-        try {
-          // The AI's genuine best inference (avoids animals already guessed this round).
-          let best: Animal | undefined;
-          try {
-            best = animalByName(await withTimeout(inferAnimal(description, excluded), PHASE_TIMEOUT_MS));
-          } catch { /* fall through to a random remaining animal */ }
-          if (!best) {
-            const remaining = ANIMALS.filter((a) => !guessedIds.includes(a.id));
-            best = remaining[Math.floor(Math.random() * remaining.length)] ?? ANIMALS[0];
-          }
-          // First two guesses are deliberately WRONG (more turns = more talking).
-          // The real answer is offered from the third guess on.
-          let toGuess = best;
-          if (guessedIds.length < 2) {
-            const wrongPool = ANIMALS.filter((a) => a.id !== best!.id && !guessedIds.includes(a.id));
-            toGuess = wrongPool[Math.floor(Math.random() * wrongPool.length)] ?? best;
-          }
-          if (playing.current && toGuess) dispatch({ type: "GUESS", animal: toGuess });
-        } finally {
-          busy.current = false;
-        }
-      })();
-    }
-
-    if (state.phase === "guessing" && state.guess) {
-      busy.current = true;
-      const g = state.guess;
-      const line = `Is it a ${g.name}? ${g.emoji}`;
+      const isLast = state.guessIndex === state.plan.length - 1;
+      const line = isLast ? `Then it must be a ${g.name}! ${g.emoji}` : `Hmm… is it a ${g.name}? ${g.emoji}`;
       addMsg("ai", line); // emoji shown on screen; speak() strips it so the voice stays English
       setMascot("talking");
       (async () => {
-        try {
-          await withTimeout(speak(line), PHASE_TIMEOUT_MS);
-        } catch { /* keep going even if audio failed */ }
+        try { await withTimeout(speak(line), PHASE_TIMEOUT_MS); }
+        catch { /* keep going even if audio failed */ }
         finally {
           setMascot("idle");
           busy.current = false;
@@ -123,6 +99,7 @@ export default function App() {
     if (state.phase === "awaiting") {
       busy.current = true;
       setMascot("listening");
+      const isLast = state.guessIndex === state.plan.length - 1;
       (async () => {
         try {
           let text = "";
@@ -132,53 +109,50 @@ export default function App() {
           }
           if (!text || !playing.current) return;
           addMsg("kid", text);
-          let cmd: Command = matchCommand(text);
-          if (cmd !== "confirm") {
-            try { cmd = (await withTimeout(classifyCommand(text), PHASE_TIMEOUT_MS)) as Command; }
-            catch { /* keep matchCommand result */ }
-          }
-          if (!playing.current) return;
-          if (cmd === "confirm") {
-            dispatch({ type: "CORRECT" }); // -> revealing (image + praise handled there)
-          } else {
-            // Not a yes — treat as more description and guess again.
-            dispatch({ type: "RETRY", text });
-          }
+          // Target is known (drawn): the last guess is always correct; earlier ones advance.
+          dispatch(isLast ? { type: "CORRECT" } : { type: "NEXT_GUESS" });
         } finally {
           busy.current = false;
         }
       })();
     }
 
-    if (state.phase === "revealing" && state.guess) {
+    if (state.phase === "revealing" && state.target) {
       busy.current = true;
-      const a = state.guess;
+      const a = state.target;
+      const drawn = state.drawnIds; // includes the just-finished target
       setMascot("celebrating");
       addMsg("ai", `Yes! It's a ${a.name}! ${a.emoji}`);
       (async () => {
-        try {
-          await withTimeout(speak(`Yes! It's a ${a.name}! Great job!`), PHASE_TIMEOUT_MS);
-        } catch { /* best effort */ }
+        try { await withTimeout(speak(`Yes! It's a ${a.name}! Great job!`), PHASE_TIMEOUT_MS); }
+        catch { /* best effort */ }
         finally {
           await new Promise((r) => setTimeout(r, 1500)); // let the image land
           setMascot("idle");
           busy.current = false;
-          if (playing.current) {
+          if (!playing.current) return;
+          const d = nextDraw(drawn);
+          if (!d) {
+            dispatch({ type: "TIME_UP" }); // all 9 animals done — end the game
+          } else {
             setMessages([]); // fresh conversation for the next animal
             dispatch({ type: "NEXT" });
+            dispatch({ type: "DRAW", target: d.target, plan: d.plan });
           }
         }
       })();
     }
-  }, [state.phase]);
+  }, [state.phase, state.guessIndex]);
 
   const startGame = () => {
     setMessages([]);
     unlockAudio();
+    remaining.current = GAME_SECONDS * 1000;
     setSecondsLeft(GAME_SECONDS);
-    deadline.current = Date.now() + GAME_SECONDS * 1000;
     playing.current = true;
+    const d = nextDraw([]);
     dispatch({ type: "START" });
+    if (d) dispatch({ type: "DRAW", target: d.target, plan: d.plan });
   };
 
   const goHome = () => {
@@ -188,6 +162,17 @@ export default function App() {
 
   if (state.phase === "attract") return <AttractScreen onStart={startGame} />;
   if (state.phase === "results") return <ResultsScreen score={state.score} onDone={goHome} />;
+  if (state.phase === "drawing") {
+    return (
+      <DrawScreen
+        animal={state.target}
+        score={state.score}
+        secondsLeft={secondsLeft}
+        onGo={() => dispatch({ type: "GO" })}
+        onQuit={goHome}
+      />
+    );
+  }
 
   return (
     <PlayScreen
@@ -195,10 +180,10 @@ export default function App() {
       messages={messages}
       score={state.score}
       secondsLeft={secondsLeft}
-      reveal={state.phase === "revealing" ? state.guess : null}
+      reveal={state.phase === "revealing" ? state.target : null}
       onQuit={goHome}
       orbActive={mascot === "listening"}
-      orbLabel={mascot === "listening" ? "Listening…" : mascot === "thinking" ? "Bibo is thinking…" : "Bibo is talking…"}
+      orbLabel={mascot === "listening" ? "Listening…" : "Bibo is talking…"}
     />
   );
 }

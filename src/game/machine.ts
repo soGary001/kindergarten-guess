@@ -2,63 +2,69 @@ import type { Animal, Phase } from "./types";
 
 export interface GameState {
   phase: Phase;
-  description: string;   // accumulated description of the CURRENT animal this round
-  guess: Animal | null;  // the AI's current guess awaiting confirmation
-  guessedIds: string[];  // animal ids already guessed this round (excluded on retry)
-  score: number;         // animals correctly guessed this game
+  target: Animal | null;  // the drawn animal for this round
+  plan: Animal[];          // [wrong1, wrong2, target] — guesses for this round
+  guessIndex: number;      // index into plan of the current guess (-1 before guessing)
+  drawnIds: string[];      // every animal drawn this game (never repeated)
+  score: number;           // animals completed
 }
 
 export type Action =
   | { type: "START" }
-  | { type: "DESCRIBED"; text: string }   // child finished describing -> infer
-  | { type: "GUESS"; animal: Animal }      // AI has an inference -> speak it
-  | { type: "GUESS_SPOKEN" }               // AI finished speaking the guess
-  | { type: "CORRECT" }                    // child confirmed -> score + reveal image
-  | { type: "NEXT" }                       // reveal done -> fresh round, next animal
-  | { type: "RETRY"; text: string }        // child said no / more -> re-infer
-  | { type: "TIME_UP" }                    // 60s countdown expired
-  | { type: "RESET" };                     // back to attract
+  | { type: "DRAW"; target: Animal; plan: Animal[] } // a fresh animal was drawn (shown to child)
+  | { type: "GO" }                                    // child starts describing -> timer resumes
+  | { type: "DESCRIBED" }                             // child described -> Bibo starts guessing
+  | { type: "GUESS_SPOKEN" }
+  | { type: "NEXT_GUESS" }                            // child responded, guess was wrong -> next
+  | { type: "CORRECT" }                               // child responded on the target guess
+  | { type: "NEXT" }                                  // reveal done -> draw the next animal
+  | { type: "TIME_UP" }
+  | { type: "RESET" };
 
 export function initialState(): GameState {
-  return { phase: "attract", description: "", guess: null, guessedIds: [], score: 0 };
+  return { phase: "attract", target: null, plan: [], guessIndex: -1, drawnIds: [], score: 0 };
 }
 
-const PLAY_PHASES: readonly Phase[] = ["describing", "thinking", "guessing", "awaiting", "revealing"];
-export function isPlaying(p: Phase): boolean {
-  return PLAY_PHASES.includes(p);
+export function currentGuess(s: GameState): Animal | null {
+  return s.guessIndex >= 0 ? s.plan[s.guessIndex] ?? null : null;
 }
 
-/**
- * Pure reducer. Play actions are guarded by the expected phase so a voice
- * result that resolves late (e.g. after TIME_UP) can never resurrect the game.
- */
+/** Phases where the countdown runs. Drawing, the success reveal, attract & results are PAUSED. */
+const TIMED: readonly Phase[] = ["describing", "guessing", "awaiting"];
+export function isCounting(p: Phase): boolean {
+  return TIMED.includes(p);
+}
+
 export function reduce(state: GameState, action: Action): GameState {
   switch (action.type) {
     case "RESET":
       return initialState();
     case "START":
-      return { phase: "describing", description: "", guess: null, guessedIds: [], score: 0 };
-    case "TIME_UP":
-      return isPlaying(state.phase) ? { ...state, phase: "results" } : state;
+      return { phase: "drawing", target: null, plan: [], guessIndex: -1, drawnIds: [], score: 0 };
+    case "DRAW":
+      if (state.phase !== "drawing") return state;
+      return { ...state, target: action.target, plan: action.plan, guessIndex: -1, drawnIds: [...state.drawnIds, action.target.id] };
+    case "GO":
+      if (state.phase !== "drawing" || !state.target) return state;
+      return { ...state, phase: "describing" };
     case "DESCRIBED":
       if (state.phase !== "describing") return state;
-      return { ...state, phase: "thinking", description: `${state.description} ${action.text}`.trim() };
-    case "GUESS":
-      if (state.phase !== "thinking") return state;
-      return { ...state, phase: "guessing", guess: action.animal, guessedIds: [...state.guessedIds, action.animal.id] };
+      return { ...state, phase: "guessing", guessIndex: 0 };
     case "GUESS_SPOKEN":
       if (state.phase !== "guessing") return state;
       return { ...state, phase: "awaiting" };
+    case "NEXT_GUESS":
+      if (state.phase !== "awaiting") return state;
+      return { ...state, phase: "guessing", guessIndex: Math.min(state.guessIndex + 1, state.plan.length - 1) };
     case "CORRECT":
       if (state.phase !== "awaiting") return state;
-      // Keep `guess` (the confirmed animal) so the reveal screen can show its image.
       return { ...state, phase: "revealing", score: state.score + 1 };
     case "NEXT":
       if (state.phase !== "revealing") return state;
-      return { ...state, phase: "describing", description: "", guess: null, guessedIds: [] };
-    case "RETRY":
-      if (state.phase !== "awaiting") return state;
-      return { ...state, phase: "thinking", description: `${state.description} ${action.text}`.trim(), guess: null };
+      return { ...state, phase: "drawing", target: null, plan: [], guessIndex: -1 };
+    case "TIME_UP":
+      // End from any active phase (timed phases, or "drawing" when all animals are used).
+      return state.phase === "attract" || state.phase === "results" ? state : { ...state, phase: "results" };
     default:
       return state;
   }
