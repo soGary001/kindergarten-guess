@@ -110,7 +110,7 @@ export function PlayScreen(props: {
               onError={(e) => { const d = document.createElement("div"); d.textContent = reveal.emoji; d.style.fontSize = "200px"; e.currentTarget.replaceWith(d); }}
             />
             <div style={{ fontSize: "2.6rem", fontWeight: 900, color: "var(--pink)", marginTop: 16 }}>
-              Yes! It's a {reveal.name}! {reveal.emoji}
+              Yes! It's {/^[aeiou]/i.test(reveal.name) ? "an" : "a"} {reveal.name}! {reveal.emoji}
             </div>
           </div>
         </div>

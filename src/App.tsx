@@ -18,6 +18,9 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
+/** "a" or "an" depending on whether the word starts with a vowel sound. */
+const article = (name: string) => (/^[aeiou]/i.test(name.trim()) ? "an" : "a");
+
 /** Draw the next un-drawn animal and its guess plan, or null when all 9 are used. */
 function nextDraw(drawnIds: string[]) {
   const target = drawAnimal(drawnIds);
@@ -82,7 +85,7 @@ export default function App() {
       if (!g) return;
       busy.current = true;
       const isLast = state.guessIndex === state.plan.length - 1;
-      const line = isLast ? `Then it must be a ${g.name}! ${g.emoji}` : `Hmm… is it a ${g.name}? ${g.emoji}`;
+      const line = isLast ? `Then it must be ${article(g.name)} ${g.name}! ${g.emoji}` : `Hmm… is it ${article(g.name)} ${g.name}? ${g.emoji}`;
       addMsg("ai", line); // emoji shown on screen; speak() strips it so the voice stays English
       setMascot("talking");
       (async () => {
@@ -122,9 +125,9 @@ export default function App() {
       const a = state.target;
       const drawn = state.drawnIds; // includes the just-finished target
       setMascot("celebrating");
-      addMsg("ai", `Yes! It's a ${a.name}! ${a.emoji}`);
+      addMsg("ai", `Yes! It's ${article(a.name)} ${a.name}! ${a.emoji}`);
       (async () => {
-        try { await withTimeout(speak(`Yes! It's a ${a.name}! Great job!`), PHASE_TIMEOUT_MS); }
+        try { await withTimeout(speak(`Yes! It's ${article(a.name)} ${a.name}! Great job!`), PHASE_TIMEOUT_MS); }
         catch { /* best effort */ }
         finally {
           await new Promise((r) => setTimeout(r, 1500)); // let the image land
