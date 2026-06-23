@@ -44,3 +44,30 @@ pub async fn classify_command(transcript: String) -> Result<String, String> {
         else if word.contains("try") { "try_again" } else { "unknown" };
     Ok(out.to_string())
 }
+
+/// Returns "yes" if the utterance is a meaningful English description of an animal,
+/// "no" for gibberish/filler/off-topic. Used to gate Bibo's guessing.
+#[tauri::command]
+pub async fn is_description(transcript: String) -> Result<String, String> {
+    let key = keystore::api_key();
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": "qwen-plus",
+        "temperature": 0,
+        "messages": [
+            { "role": "system", "content":
+              "A child is describing an animal in English. Reply with only one word: \
+               'yes' if their utterance is a meaningful description of what an animal looks like \
+               or does (e.g. 'it is big and grey', 'it can hop'), or \
+               'no' if it is gibberish, filler, random words, or not a description." },
+            { "role": "user", "content": transcript }
+        ]
+    });
+    let resp = client
+        .post("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+        .bearer_auth(&key).json(&body).send().await
+        .map_err(|e| format!("is_description failed: {e}"))?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let word = v["choices"][0]["message"]["content"].as_str().unwrap_or("yes").to_lowercase();
+    Ok(if word.contains("no") { "no" } else { "yes" }.to_string())
+}

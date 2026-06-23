@@ -29,6 +29,11 @@ export function classifyCommand(transcript: string): Promise<string> {
   return invoke<string>("classify_command", { transcript });
 }
 
+/** "yes" if the transcript is a meaningful animal description, else "no". */
+export function isDescription(transcript: string): Promise<string> {
+  return invoke<string>("is_description", { transcript });
+}
+
 /**
  * Keep only English letters, digits, and safe punctuation before sending to TTS.
  * Emoji and any non-Latin characters are dropped so the voice never reads them

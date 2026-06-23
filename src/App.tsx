@@ -1,7 +1,8 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { initialState, reduce, currentGuess, isCounting } from "./game/machine";
 import { drawAnimal, buildGuessPlan } from "./game/draw";
-import { listenAndTranscribe, speak, unlockAudio } from "./voice/bailian";
+import { isLikelyMeaningful } from "./game/meaningful";
+import { listenAndTranscribe, speak, unlockAudio, isDescription } from "./voice/bailian";
 import { AttractScreen } from "./screens/AttractScreen";
 import { DrawScreen } from "./screens/DrawScreen";
 import { PlayScreen, type Msg } from "./screens/PlayScreen";
@@ -21,6 +22,23 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 /** "a" or "an" depending on whether the word starts with a vowel sound. */
 const article = (name: string) => (/^[aeiou]/i.test(name.trim()) ? "an" : "a");
 
+/** Spoken when the child says something that isn't a real description (rotates). */
+const REPROMPTS = [
+  "Hmm, tell me more! What does it look like?",
+  "Can you say a whole sentence about it?",
+  "What color is it? What can it do?",
+];
+
+/** A guess only fires for a meaningful description: cheap local filter, then LLM confirm. */
+async function meaningful(text: string): Promise<boolean> {
+  if (!isLikelyMeaningful(text)) return false;
+  try {
+    return (await withTimeout(isDescription(text), PHASE_TIMEOUT_MS)) === "yes";
+  } catch {
+    return true; // LLM unreachable -> trust the local heuristic rather than block the game
+  }
+}
+
 /** Draw the next un-drawn animal and its guess plan, or null when all 9 are used. */
 function nextDraw(drawnIds: string[]) {
   const target = drawAnimal(drawnIds);
@@ -36,6 +54,15 @@ export default function App() {
   const playing = useRef(false);          // true between START and TIME_UP/RESET
   const remaining = useRef(GAME_SECONDS * 1000); // ms left; only decremented in counting phases
   const addMsg = (who: Msg["who"], text: string) => setMessages((m) => [...m, { who, text }]);
+  const repromptIdx = useRef(0);
+  const reprompt = async () => {
+    const line = REPROMPTS[repromptIdx.current % REPROMPTS.length];
+    repromptIdx.current++;
+    addMsg("ai", line);
+    setMascot("talking");
+    await withTimeout(speak(line), PHASE_TIMEOUT_MS).catch(() => {});
+    setMascot("listening");
+  };
 
   // Countdown — runs ONLY during counting phases (paused while drawing), using real deltas.
   useEffect(() => {
@@ -65,14 +92,18 @@ export default function App() {
       setMascot("listening");
       (async () => {
         try {
-          let text = "";
-          while (playing.current && !text) {
-            try { text = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS); }
-            catch { text = ""; }
-          }
-          if (text && playing.current) {
+          // Keep listening until the child gives a MEANINGFUL description; nudge otherwise.
+          while (playing.current) {
+            let text = "";
+            while (playing.current && !text) {
+              try { text = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS); }
+              catch { text = ""; }
+            }
+            if (!text || !playing.current) return;
             addMsg("kid", text);
-            dispatch({ type: "DESCRIBED" });
+            if (await meaningful(text)) { if (playing.current) dispatch({ type: "DESCRIBED" }); return; }
+            if (!playing.current) return;
+            await reprompt(); // not a real description -> guide and listen again (no guess)
           }
         } finally {
           busy.current = false;
@@ -105,15 +136,21 @@ export default function App() {
       const isLast = state.guessIndex === state.plan.length - 1;
       (async () => {
         try {
-          let text = "";
-          while (playing.current && !text) {
-            try { text = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS); }
-            catch { text = ""; }
+          while (playing.current) {
+            let text = "";
+            while (playing.current && !text) {
+              try { text = await withTimeout(listenAndTranscribe(), PHASE_TIMEOUT_MS); }
+              catch { text = ""; }
+            }
+            if (!text || !playing.current) return;
+            addMsg("kid", text);
+            // On the correct (last) guess, any reply confirms it -> celebrate.
+            if (isLast) { dispatch({ type: "CORRECT" }); return; }
+            // On a wrong guess, only a MEANINGFUL description earns the next guess.
+            if (await meaningful(text)) { if (playing.current) dispatch({ type: "NEXT_GUESS" }); return; }
+            if (!playing.current) return;
+            await reprompt();
           }
-          if (!text || !playing.current) return;
-          addMsg("kid", text);
-          // Target is known (drawn): the last guess is always correct; earlier ones advance.
-          dispatch(isLast ? { type: "CORRECT" } : { type: "NEXT_GUESS" });
         } finally {
           busy.current = false;
         }

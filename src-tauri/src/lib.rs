@@ -20,6 +20,7 @@ pub fn run() {
       commands::transcribe,
       commands::synthesize,
       commands::classify_command,
+      commands::is_description,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
