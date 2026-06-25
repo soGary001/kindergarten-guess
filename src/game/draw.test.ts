@@ -13,12 +13,10 @@ test("drawAnimal returns null when all 9 are used", () => {
   expect(drawAnimal(ANIMALS.map((a) => a.id))).toBeNull();
 });
 
-test("buildGuessPlan: 2 distinct wrong guesses then the target last", () => {
+test("buildGuessPlan: 1 wrong guess then the target last", () => {
   const target = ANIMALS.find((a) => a.id === "elephant")!;
   const plan = buildGuessPlan(target, () => 0.99);
-  expect(plan).toHaveLength(3);
-  expect(plan[2].id).toBe("elephant");
-  const wrongs = plan.slice(0, 2);
-  expect(wrongs.every((a) => a.id !== "elephant")).toBe(true);
-  expect(new Set(wrongs.map((a) => a.id)).size).toBe(2);
+  expect(plan).toHaveLength(2);
+  expect(plan[1].id).toBe("elephant");
+  expect(plan[0].id).not.toBe("elephant");
 });

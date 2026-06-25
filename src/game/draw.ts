@@ -8,11 +8,11 @@ export function drawAnimal(drawnIds: string[], rng: () => number = Math.random):
   return pool[Math.floor(rng() * pool.length)];
 }
 
-/** Guess sequence for a known target: 2 distinct wrong animals, then the target last. */
+/** Guess sequence for a known target: 1 wrong animal, then the target last. */
 export function buildGuessPlan(target: Animal, rng: () => number = Math.random): Animal[] {
   const pool = ANIMALS.filter((a) => a.id !== target.id);
   const wrongs: Animal[] = [];
-  while (wrongs.length < 2 && pool.length > 0) {
+  while (wrongs.length < 1 && pool.length > 0) {
     wrongs.push(pool.splice(Math.floor(rng() * pool.length), 1)[0]);
   }
   return [...wrongs, target];
